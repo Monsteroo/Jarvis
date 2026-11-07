@@ -1,0 +1,6 @@
+.runtime/
+.build/
+dist/
+.DS_Store
+*.wav
+*.jsonl

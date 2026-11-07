@@ -1,0 +1,50 @@
+uk|Відкрий Телеграм.
+uk|Відкрий браузер.
+uk|Перемкнися на термінал.
+uk|Закрий калькулятор.
+uk|Сховай поточну програму.
+uk|Згорни поточне вікно.
+uk|Розташуй вікно зліва.
+uk|Перемісти вікно вправо.
+uk|Розгорни вікно на весь екран.
+uk|Вийди з повноекранного режиму.
+uk|Зроби гучність тридцять відсотків.
+uk|Вимкни звук.
+uk|Увімкни звук.
+uk|Зроби яскравість п'ятдесят відсотків.
+uk|Не закривай цю програму.
+ru|Открой браузер.
+ru|Переключись на терминал.
+ru|Закрой калькулятор.
+ru|Сверни все окна.
+ru|Поставь громкость двадцать пять процентов.
+ru|Отключи звук.
+ru|Сделай экран ярче.
+ru|Включи режим не беспокоить.
+ru|Не отправляй это письмо.
+ru|Напечатай: добрый день, спасибо за ответ.
+en|Open the browser.
+en|Switch to Terminal.
+en|Close Calculator.
+en|Minimize this window.
+en|Move the window to the left.
+en|Set volume to thirty percent.
+en|Mute the sound.
+en|Turn off full screen.
+en|Do not send this message.
+en|Type: thank you for your reply.
+mixed|Відкрий Visual Studio Code.
+mixed|Перемкнися на Google Chrome.
+mixed|Знайди файл invoice у Downloads.
+mixed|Відкрий README у проєкті Jarvis.
+mixed|Запусти Harvey для пошуку клієнтів у Дніпрі.
+mixed|Надрукуй: please review цей документ.
+mixed|Открой Finder и папку Documents.
+mixed|Переключись на Safari, будь ласка.
+mixed|Знайди в Google кав'ярні Львова.
+mixed|Відкрий GitHub у браузері.
+mixed|Напиши Антону: meeting о пів на третю.
+mixed|Не запускай workflow у n8n.
+mixed|Згорни Telegram, volume thirty percent.
+mixed|Встав текст: good morning, дякую за лист.
+mixed|Зупини Jarvis, cancel the task.
