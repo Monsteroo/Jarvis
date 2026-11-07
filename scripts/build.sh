@@ -30,13 +30,19 @@ if [[ -f "$ROOT/.runtime/models/ggml-base.bin" ]]; then
 else
   echo "warning: ggml-base.bin missing; bridge model tests skipped (run scripts/setup.sh)" >&2
 fi
+# Unoptimised so assert() stays active.
+swiftc "${SWIFT_FLAGS[@]}" -swift-version 5 -Onone -parse-as-library Sources/Audio.swift Tests/CaptureGateTests.swift -o .build/capture-gate-tests
+.build/capture-gate-tests
+swiftc "${SWIFT_FLAGS[@]}" -swift-version 5 -Onone -parse-as-library Sources/Measurement.swift Tests/MeasurementTests.swift -o .build/measurement-tests
+.build/measurement-tests
+python3 -I -m unittest discover -s Tests -p 'test_*.py' -q
 if [[ -f Sources/Benchmark.swift ]]; then
 swiftc "${SWIFT_FLAGS[@]}" -swift-version 5 -O -parse-as-library -import-objc-header Sources/WhisperBridge.h Sources/Benchmark.swift .build/WhisperBridge.o "${LIBS[@]}" "${FRAMEWORKS[@]}" -framework AVFoundation -lc++ -o .build/jarvis-benchmark
 fi
 if [[ -f Sources/App.swift ]]; then
 APP="$ROOT/dist/Jarvis Voice Lab.app"
 mkdir -p "$APP/Contents/MacOS"
-swiftc "${SWIFT_FLAGS[@]}" -swift-version 5 -O -parse-as-library -import-objc-header Sources/WhisperBridge.h Sources/App.swift Sources/Audio.swift .build/WhisperBridge.o "${LIBS[@]}" "${FRAMEWORKS[@]}" -framework AppKit -framework AVFoundation -framework Carbon -lc++ -o "$APP/Contents/MacOS/JarvisVoiceLab"
+swiftc "${SWIFT_FLAGS[@]}" -swift-version 5 -O -parse-as-library -import-objc-header Sources/WhisperBridge.h Sources/App.swift Sources/Audio.swift Sources/Measurement.swift .build/WhisperBridge.o "${LIBS[@]}" "${FRAMEWORKS[@]}" -framework AppKit -framework AVFoundation -framework Carbon -lc++ -o "$APP/Contents/MacOS/JarvisVoiceLab"
 python3 - "$APP/Contents/Info.plist" "$ROOT" <<'PY'
 import plistlib,sys
 with open(sys.argv[1],'wb') as f:

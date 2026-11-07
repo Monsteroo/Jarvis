@@ -116,6 +116,19 @@ final class JarvisApp: NSObject, NSApplicationDelegate {
     private var started = 0.0
     private var observers: [NSObjectProtocol] = []
     private var hotKeyAvailable = false
+    private let measureToggle = NSButton(checkboxWithTitle: "Режим вимірювань", target: nil, action: nil)
+    private let skipButton = NSButton(title: "Пропустити фразу", target: nil, action: nil)
+    private let promptLabel = NSTextField(wrappingLabelWithString: "")
+    private var prompts: [Prompt] = []
+    private var measurementLog: MeasurementLog?
+    private var progress: MeasurementProgress?
+    private var measuring: Bool { measureToggle.state == .on }
+
+    private var projectRoot: String {
+        Bundle.main.object(forInfoDictionaryKey: "JarvisProjectRoot") as? String ?? FileManager.default.currentDirectoryPath
+    }
+    private var modelName: String { model.indexOfSelectedItem == 1 ? "small" : "base" }
+    private var languageCode: String { ["uk", "ru", "en", "auto"][max(0, language.indexOfSelectedItem)] }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         makeWindow()
@@ -169,6 +182,16 @@ final class JarvisApp: NSObject, NSApplicationDelegate {
         cancelButton.target = self
         cancelButton.action = #selector(cancelFromButton)
         cancelButton.isEnabled = false
+        language.target = self
+        language.action = #selector(refreshMeasurement)
+        measureToggle.target = self
+        measureToggle.action = #selector(refreshMeasurement)
+        measureToggle.toolTip = "Показує фрази з docs/benchmarks/prompts.txt і записує текст та час у .runtime/measurements. Аудіо не зберігається."
+        skipButton.target = self
+        skipButton.action = #selector(skipPrompt)
+        skipButton.isHidden = true
+        promptLabel.font = .systemFont(ofSize: 20, weight: .semibold)
+        promptLabel.isHidden = true
         let controls = NSStackView(views: [enableButton, language, copyButton])
         controls.orientation = .horizontal
         controls.spacing = 12
@@ -185,9 +208,9 @@ final class JarvisApp: NSObject, NSApplicationDelegate {
         scroll.hasVerticalScroller = true
         scroll.borderType = .bezelBorder
         scroll.documentView = transcript
-        let settings = NSStackView(views: [NSTextField(labelWithString: "Модель:"), model, cancelButton])
+        let settings = NSStackView(views: [NSTextField(labelWithString: "Модель:"), model, cancelButton, measureToggle, skipButton])
         settings.spacing = 10
-        let stack = NSStackView(views: [heading, hint, controls, settings, status, scroll, timing])
+        let stack = NSStackView(views: [heading, hint, controls, settings, promptLabel, status, scroll, timing])
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 18
@@ -201,7 +224,8 @@ final class JarvisApp: NSObject, NSApplicationDelegate {
             scroll.widthAnchor.constraint(equalTo: stack.widthAnchor),
             scroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 150),
             hint.widthAnchor.constraint(equalTo: stack.widthAnchor),
-            status.widthAnchor.constraint(equalTo: stack.widthAnchor)
+            status.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            promptLabel.widthAnchor.constraint(equalTo: stack.widthAnchor)
         ])
         window.makeKeyAndOrderFront(nil)
     }
@@ -211,10 +235,8 @@ final class JarvisApp: NSObject, NSApplicationDelegate {
         modelLoading = true
         model.isEnabled = false
         status.stringValue = "Завантаження локальної моделі…"
-        let root = Bundle.main.object(forInfoDictionaryKey: "JarvisProjectRoot") as? String
-            ?? FileManager.default.currentDirectoryPath
-        let name = model.indexOfSelectedItem == 1 ? "small" : "base"
-        speech.load(path: root + "/.runtime/models/ggml-" + name + ".bin") { [weak self] ready in
+        refreshMeasurement()
+        speech.load(path: projectRoot + "/.runtime/models/ggml-" + modelName + ".bin") { [weak self] ready in
             guard let self else { return }
             self.modelLoading = false
             self.modelReady = ready
@@ -324,6 +346,8 @@ final class JarvisApp: NSObject, NSApplicationDelegate {
         started = ProcessInfo.processInfo.systemUptime
         language.isEnabled = false
         model.isEnabled = false
+        measureToggle.isEnabled = false
+        skipButton.isEnabled = false
         status.stringValue = "● Слухаю… Відпустіть ⌃⌥Пробіл для розпізнавання."
         timing.stringValue = "Запис: 0,0 с / 30 с"
         enableEscape()
@@ -352,15 +376,16 @@ final class JarvisApp: NSObject, NSApplicationDelegate {
         let samples = audio.stop()
         let duration = Double(samples.count) / 16_000
         guard duration >= 0.25 else {
-            language.isEnabled = true
-            model.isEnabled = true
+            restoreControls()
             cancelButton.isEnabled = false
             disableEscape()
             status.stringValue = "Запис надто короткий. Утримуйте ⌃⌥Пробіл і скажіть фразу."
             return
         }
         processing = true
-        let code = ["uk", "ru", "en", "auto"][max(0, language.indexOfSelectedItem)]
+        let code = languageCode
+        let measured = measuring ? currentPrompt() : nil
+        let measuredModel = modelName
         status.stringValue = timedOut ? "Досягнуто 30 с. Мікрофон вимкнено, розпізнаю…" : "Мікрофон вимкнено. Розпізнаю локально…"
         timing.stringValue = String(format: "Аудіо: %.1f с · розпізнавання…", duration)
         speech.transcribe(samples, language: code) { [weak self] text, elapsed in
@@ -368,8 +393,7 @@ final class JarvisApp: NSObject, NSApplicationDelegate {
             let responseTime = ProcessInfo.processInfo.systemUptime - releasedAt
             self.processing = false
             self.cancelButton.isEnabled = false
-            self.language.isEnabled = true
-            self.model.isEnabled = true
+            self.restoreControls()
             self.disableEscape()
             if let text {
                 self.transcript.string = text
@@ -380,6 +404,11 @@ final class JarvisApp: NSObject, NSApplicationDelegate {
             }
             self.timing.stringValue = String(format: "Аудіо: %.1f с · Whisper: %.2f с · відповідь: %.2f с", duration, elapsed, responseTime)
             self.timing.toolTip = "Відповідь — час від відпускання клавіші (або ліміту 30 с) до появи тексту."
+            if let measured {
+                let status: MeasurementRecord.Status = text == nil ? .error : (text!.isEmpty ? .empty : .ok)
+                self.logMeasurement(measured, model: measuredModel, languageSetting: code, transcript: text ?? "",
+                                    status: status, timedOut: timedOut, audio: duration, whisper: elapsed, response: responseTime)
+            }
         }
     }
 
@@ -401,11 +430,72 @@ final class JarvisApp: NSObject, NSApplicationDelegate {
         if !modelLoading { speech.cancel() }
         processing = false
         cancelButton.isEnabled = false
-        language.isEnabled = true
-        model.isEnabled = !modelLoading
+        restoreControls()
         disableEscape()
         status.stringValue = message
         timing.stringValue = "Звук не збережено на диск."
+    }
+
+    private func restoreControls() {
+        language.isEnabled = true
+        model.isEnabled = !modelLoading
+        measureToggle.isEnabled = true
+        skipButton.isEnabled = true
+    }
+
+    // MARK: Measurement mode
+
+    private func currentPrompt() -> (progress: MeasurementProgress, prompt: Prompt)? {
+        guard let progress, !progress.finished, progress.index < prompts.count else { return nil }
+        return (progress, prompts[progress.index])
+    }
+
+    @objc private func refreshMeasurement() {
+        guard measuring else {
+            promptLabel.isHidden = true
+            skipButton.isHidden = true
+            return
+        }
+        if prompts.isEmpty {
+            let path = projectRoot + "/docs/benchmarks/prompts.txt"
+            prompts = PromptSet.parse((try? String(contentsOfFile: path, encoding: .utf8)) ?? "")
+            measurementLog = MeasurementLog(url: URL(fileURLWithPath: projectRoot + "/.runtime/measurements/measurements.jsonl"))
+        }
+        promptLabel.isHidden = false
+        guard !prompts.isEmpty, let measurementLog else {
+            promptLabel.stringValue = "Не знайдено docs/benchmarks/prompts.txt."
+            skipButton.isHidden = true
+            return
+        }
+        progress = MeasurementProgress.next(records: measurementLog.records(), model: modelName,
+                                            languageSetting: languageCode, promptCount: prompts.count)
+        if let current = currentPrompt() {
+            promptLabel.stringValue = "Прохід \(current.progress.pass)/\(MeasurementProgress.passes) · \(current.progress.index + 1)/\(prompts.count) · [\(current.prompt.language)] \(current.prompt.text)"
+            skipButton.isHidden = false
+        } else {
+            promptLabel.stringValue = "Усі \(MeasurementProgress.passes) проходи для \(modelName) / \(languageCode) записано. Запустіть scripts/analyze_measurements.py."
+            skipButton.isHidden = true
+        }
+    }
+
+    @objc private func skipPrompt() {
+        guard !gate.recording, !processing, let current = currentPrompt() else { return }
+        logMeasurement(current, model: modelName, languageSetting: languageCode, transcript: "",
+                       status: .skipped, timedOut: false, audio: 0, whisper: 0, response: 0)
+    }
+
+    private func logMeasurement(_ current: (progress: MeasurementProgress, prompt: Prompt), model: String, languageSetting: String,
+                                transcript: String, status: MeasurementRecord.Status, timedOut: Bool,
+                                audio: Double, whisper: Double, response: Double) {
+        let record = MeasurementRecord(
+            timestamp: ISO8601DateFormatter().string(from: Date()), model: model, languageSetting: languageSetting,
+            pass: current.progress.pass, promptIndex: current.progress.index, promptLanguage: current.prompt.language,
+            expected: current.prompt.text, transcript: transcript, status: status, timedOut: timedOut,
+            audioSeconds: audio, whisperSeconds: whisper, responseSeconds: response)
+        do { try measurementLog?.append(record) } catch {
+            self.status.stringValue = "Не вдалося записати вимір: \(error.localizedDescription)"
+        }
+        refreshMeasurement()
     }
 
     @objc private func copyTranscript() {
