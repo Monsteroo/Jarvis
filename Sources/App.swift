@@ -96,6 +96,11 @@ final class JarvisApp: NSObject, NSApplicationDelegate {
     private let transcript = NSTextView()
     private let enableButton = NSButton(title: "Увімкнути мікрофон", target: nil, action: nil)
     private let cancelButton = NSButton(title: "Скасувати", target: nil, action: nil)
+    private let diagnostic = DiagnosticCapture()
+    private let diagnosticButton = NSButton(title: "Зберегти наступну фразу у WAV", target: nil, action: nil)
+    private let revealButton = NSButton(title: "Показати WAV", target: nil, action: nil)
+    private let diagnosticLabel = NSTextField(wrappingLabelWithString: "Збереження аудіо вимкнено.")
+    private var diagnosticURL: URL?
     private let copyButton = NSButton(title: "Копіювати текст", target: nil, action: nil)
     private let language = NSPopUpButton(frame: .zero, pullsDown: false)
     private let model = NSPopUpButton(frame: .zero, pullsDown: false)
@@ -156,10 +161,10 @@ final class JarvisApp: NSObject, NSApplicationDelegate {
     }
 
     private func makeWindow() {
-        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 700, height: 480),
+        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 800, height: 650),
                           styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
         window.title = "Jarvis — локальний голос"
-        window.minSize = NSSize(width: 570, height: 390)
+        window.minSize = NSSize(width: 760, height: 610)
         window.center()
         let heading = NSTextField(labelWithString: "Jarvis")
         heading.font = .systemFont(ofSize: 30, weight: .semibold)
@@ -210,7 +215,15 @@ final class JarvisApp: NSObject, NSApplicationDelegate {
         scroll.documentView = transcript
         let settings = NSStackView(views: [NSTextField(labelWithString: "Модель:"), model, cancelButton, measureToggle, skipButton])
         settings.spacing = 10
-        let stack = NSStackView(views: [heading, hint, controls, settings, promptLabel, status, scroll, timing])
+        diagnosticButton.target = self
+        diagnosticButton.action = #selector(toggleDiagnostic)
+        revealButton.target = self
+        revealButton.action = #selector(revealDiagnostic)
+        revealButton.isEnabled = false
+        diagnosticLabel.font = .systemFont(ofSize: 12)
+        let diagnosticControls = NSStackView(views: [diagnosticButton, revealButton])
+        diagnosticControls.spacing = 12
+        let stack = NSStackView(views: [heading, hint, controls, settings, diagnosticControls, diagnosticLabel, promptLabel, status, scroll, timing])
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 18
@@ -338,11 +351,11 @@ final class JarvisApp: NSObject, NSApplicationDelegate {
         let authorized = AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
         guard gate.press(enabled: enabled, authorized: authorized, ready: modelReady && !processing && hotKeyAvailable) else { return }
         do { try audio.start() } catch {
-            gate.cancel()
-            status.stringValue = error.localizedDescription
+            cancelSession(message: error.localizedDescription)
             return
         }
         cancelButton.isEnabled = true
+        diagnosticButton.isEnabled = false
         started = ProcessInfo.processInfo.systemUptime
         language.isEnabled = false
         model.isEnabled = false
@@ -375,6 +388,23 @@ final class JarvisApp: NSObject, NSApplicationDelegate {
         stopTimers()
         let samples = audio.stop()
         let duration = Double(samples.count) / 16_000
+        let wasDiagnostic = diagnostic.armed
+        if wasDiagnostic {
+            diagnosticButton.title = "Зберегти наступну фразу у WAV"
+            if duration < 0.25 || timedOut {
+                diagnostic.cancel()
+                diagnosticLabel.stringValue = "Діагностичний запис скасовано: надто короткий або досягнуто ліміту."
+            } else {
+                do {
+                    diagnosticURL = try diagnostic.finish(samples: samples,
+                        directory: URL(fileURLWithPath: projectRoot + "/.runtime/diagnostics"))
+                    revealButton.isEnabled = diagnosticURL != nil
+                    diagnosticLabel.stringValue = "WAV збережено локально. Збереження наступних фраз вимкнено."
+                } catch {
+                    diagnosticLabel.stringValue = "Не вдалося зберегти WAV: " + error.localizedDescription
+                }
+            }
+        }
         guard duration >= 0.25 else {
             restoreControls()
             cancelButton.isEnabled = false
@@ -384,7 +414,7 @@ final class JarvisApp: NSObject, NSApplicationDelegate {
         }
         processing = true
         let code = languageCode
-        let measured = measuring ? currentPrompt() : nil
+        let measured = measuring && !wasDiagnostic ? currentPrompt() : nil
         let measuredModel = modelName
         status.stringValue = timedOut ? "Досягнуто 30 с. Мікрофон вимкнено, розпізнаю…" : "Мікрофон вимкнено. Розпізнаю локально…"
         timing.stringValue = String(format: "Аудіо: %.1f с · розпізнавання…", duration)
@@ -425,6 +455,11 @@ final class JarvisApp: NSObject, NSApplicationDelegate {
 
     private func cancelSession(message: String) {
         gate.cancel()
+        if diagnostic.armed {
+            diagnostic.cancel()
+            diagnosticButton.title = "Зберегти наступну фразу у WAV"
+            diagnosticLabel.stringValue = "Збереження скасовано. Новий файл не створено."
+        }
         stopTimers()
         audio.stop()
         if !modelLoading { speech.cancel() }
@@ -433,14 +468,32 @@ final class JarvisApp: NSObject, NSApplicationDelegate {
         restoreControls()
         disableEscape()
         status.stringValue = message
-        timing.stringValue = "Звук не збережено на диск."
+        timing.stringValue = "Поточну операцію скасовано. Раніше збережені WAV залишаються на Mac."
     }
 
     private func restoreControls() {
+        diagnosticButton.isEnabled = true
         language.isEnabled = true
         model.isEnabled = !modelLoading
         measureToggle.isEnabled = true
         skipButton.isEnabled = true
+    }
+
+    @objc private func toggleDiagnostic() {
+        guard !gate.recording, !processing else { return }
+        if diagnostic.armed {
+            diagnostic.cancel()
+            diagnosticButton.title = "Зберегти наступну фразу у WAV"
+            diagnosticLabel.stringValue = "Збереження аудіо вимкнено."
+        } else {
+            diagnostic.arm()
+            diagnosticButton.title = "Скасувати збереження WAV"
+            diagnosticLabel.stringValue = "Наступну фразу буде збережено локально (16 кГц WAV). Скажіть 5–8 секунд; Esc скасовує."
+        }
+    }
+
+    @objc private func revealDiagnostic() {
+        if let diagnosticURL { NSWorkspace.shared.activateFileViewerSelecting([diagnosticURL]) }
     }
 
     // MARK: Measurement mode
