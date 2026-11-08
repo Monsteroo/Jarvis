@@ -31,6 +31,29 @@ class Tests(unittest.TestCase):
         self.assertEqual(s["response_s"]["p50"], 1.0)
         self.assertEqual(s["status_counts"]["skipped"], 1)
 
+    def test_timeout_with_correct_text_is_failure(self):
+        timeout = dict(rec(), timed_out=True)
+        (s,) = am.summarise([timeout])
+        self.assertEqual(s["exact_match"], 0)
+        self.assertEqual(s["mean_wer"], 1)
+        self.assertEqual(s["response_s"]["n"], 0)
+        self.assertEqual(s["correct_within_2s"], 0)
+
+    def test_deadline_rate_counts_every_attempt(self):
+        rows = [rec(response=2), rec(response=2.01), rec(status="error"),
+                rec(status="skipped"), dict(rec(), timed_out=True),
+                rec(transcript="неправильний текст")]
+        (s,) = am.summarise(rows)
+        self.assertAlmostEqual(s["correct_within_2s"], 1 / 6)
+        self.assertEqual(s["attempts"], 6)
+        self.assertEqual(s["completed_response_s"]["n"], 5)
+
+    def test_failed_completion_latency_is_visible(self):
+        (s,) = am.summarise([rec(response=0.5), rec(status="error", response=8)])
+        self.assertEqual(s["response_s"]["p50"], 0.5)
+        self.assertEqual(s["completed_response_s"]["p50"], 4.25)
+        self.assertEqual(s["completed_response_s"]["n"], 2)
+
     def test_groups_by_model_and_language(self):
         self.assertEqual(len(am.summarise([rec(), rec(lang="auto")])), 2)
 

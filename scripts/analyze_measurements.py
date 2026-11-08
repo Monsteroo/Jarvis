@@ -2,7 +2,8 @@
 """Summarise .runtime/measurements/measurements.jsonl per model + language setting.
 
 Accuracy counts every attempt: errors, empty results, timeouts and skips are failures,
-never dropped. Latency percentiles use attempts that produced text (status ok).
+never dropped. Latency is reported separately for text responses and all completed attempts.
+Correct-within-2s uses every attempt, including skips and timeouts.
 Prints aggregates only, not transcripts, so the output is safe to share.
 """
 import json
@@ -54,22 +55,29 @@ def summarise(records):
     for (model, lang), rows in sorted(groups.items()):
         by_prompt_lang = defaultdict(lambda: [0, 0])
         exact = wer = cer = 0.0
+        correct_within_2s = 0
         for r in rows:
-            exp_w, got_w = normalize(r["expected"]), normalize(r["transcript"] if r["status"] == "ok" else "")
-            ok = exp_w == got_w
+            successful = r["status"] == "ok" and not r.get("timed_out", False)
+            exp_w, got_w = normalize(r["expected"]), normalize(r["transcript"] if successful else "")
+            ok = successful and exp_w == got_w
+            correct_within_2s += ok and 0 <= r["response_s"] <= 2
             exact += ok
             wer += error_rate(exp_w, got_w)
             cer += error_rate(" ".join(exp_w), " ".join(got_w))
             by_prompt_lang[r["prompt_language"]][0] += ok
             by_prompt_lang[r["prompt_language"]][1] += 1
         n = len(rows)
-        timed = [r for r in rows if r["status"] == "ok"]
+        timed = [r for r in rows if r["status"] == "ok" and not r.get("timed_out", False)]
+        completed = [r for r in rows if r["status"] != "skipped"]
         status = defaultdict(int)
         for r in rows:
             status[r["status"]] += 1
             status["timed_out"] += bool(r.get("timed_out"))
         out.append({
             "model": model, "language_setting": lang, "attempts": n,
+            "correct_within_2s": correct_within_2s / n,
+            "completed_response_s": {"p50": percentile([r["response_s"] for r in completed], .5),
+                                     "p95": percentile([r["response_s"] for r in completed], .95), "n": len(completed)},
             "passes": sorted({r["pass"] for r in rows}),
             "exact_match": exact / n, "mean_wer": wer / n, "mean_cer": cer / n,
             "exact_by_prompt_language": {k: f"{v[0]}/{v[1]}" for k, v in sorted(by_prompt_lang.items())},
@@ -98,8 +106,11 @@ def main(argv):
         print("exact by prompt language:", s["exact_by_prompt_language"])
         print("statuses:", s["status_counts"])
         r, w = s["response_s"], s["whisper_s"]
-        print(f"response p50 {fmt(r['p50'])} s · p95 {fmt(r['p95'])} s (n={r['n']}) · whisper p50 {fmt(w['p50'])} s · p95 {fmt(w['p95'])} s")
-    print("\nResponse = key-up → text. Not speech-end-to-action. Exact match ignores case and punctuation;"
+        print(f"text responses (no timeout): p50 {fmt(r['p50'])} s · p95 {fmt(r['p95'])} s (n={r['n']}) · whisper p50 {fmt(w['p50'])} s · p95 {fmt(w['p95'])} s")
+        c = s["completed_response_s"]
+        print(f"all completed (including failures/timeouts): p50 {fmt(c['p50'])} s · p95 {fmt(c['p95'])} s (n={c['n']})")
+        print(f"correct within 2 s: {s['correct_within_2s']:.0%} of ALL attempts, including skips/timeouts")
+    print("\nTimeout response starts at the recording limit, not speech end. Esc cancellations are not logged.\nResponse = key-up → text. Not speech-end-to-action. Exact match ignores case and punctuation;"
           " names, numbers and negations still need a manual check.")
     return 0
 
