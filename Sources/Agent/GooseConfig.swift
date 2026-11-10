@@ -15,6 +15,10 @@ struct GooseConfig {
               root.isFileURL, root.path.hasPrefix("/") else { throw AgentError.invalidConfiguration }
         self.provider = provider; self.model = model; self.root = root
     }
+    /// User-selected provider for Jarvis. The model remains configurable.
+    static func openAI(root: URL, model: String = "gpt-5.4-mini") throws -> GooseConfig {
+        try GooseConfig(provider: "openai", model: model, root: root)
+    }
     func verifyExecutable(_ executable: URL) throws {
         guard executable.isFileURL,
               let data = try? Data(contentsOf: executable, options: .mappedIfSafe), data.count <= 100_000_000,

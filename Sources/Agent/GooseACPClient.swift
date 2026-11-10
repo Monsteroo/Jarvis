@@ -3,7 +3,7 @@ import Foundation
 struct GooseAnswer { let text: String; let cost: Money?; let stopReason: String }
 struct GooseStreamEvent: Sendable {
     let turnID: UUID
-    enum Kind: Sendable { case text(String), usage(Money), permissionRejected }
+    enum Kind: Sendable { case text(String), usage(Money), permissionRejected, proposalAllowed }
     let kind: Kind
 }
 
@@ -16,6 +16,8 @@ actor GooseACPClient {
     private var cost: Money?
     private var invalidUsage = false
     private var ceiling: Money?
+    private var allowsPlanning = false
+    private var proposals: [String: JSONValue] = [:]
     private var listeners: [UUID: AsyncStream<GooseStreamEvent>.Continuation] = [:]
     init(transport: JSONRPCProcess) { self.transport = transport }
     func stream() -> AsyncStream<GooseStreamEvent> {
@@ -30,7 +32,7 @@ actor GooseACPClient {
         guard let active else { return }
         for continuation in listeners.values { continuation.yield(GooseStreamEvent(turnID: active, kind: kind)) }
     }
-    func initialize(cwd: URL) async throws -> String {
+    func initialize(cwd: URL, mcpServer: GooseMCPServer? = nil) async throws -> String {
         guard session == nil, cwd.isFileURL else { throw AgentError.invalidConfiguration }
         await transport.setHandler { [weak self] message in await self?.receive(message) }
         let initialized = try await transport.request("initialize", .object([
@@ -38,9 +40,9 @@ actor GooseACPClient {
                 "fs": .object(["readTextFile": .bool(false), "writeTextFile": .bool(false)]), "terminal": .bool(false)]),
             "clientInfo": .object(["name": .string("jarvis"), "version": .string("0.1")])]))
         guard initialized["protocolVersion"].decimal == 1 else { throw AgentError.invalidMessage }
-        let created = try await transport.request("session/new", .object(["cwd": .string(cwd.path), "mcpServers": .array([])]))
+        let created = try await transport.request("session/new", .object(["cwd": .string(cwd.path), "mcpServers": .array(mcpServer.map { [$0.descriptor] } ?? [])]))
         guard let id = created["sessionId"].string, !id.isEmpty, id.count <= 256 else { throw AgentError.invalidMessage }
-        session = id
+        session = id; allowsPlanning = mcpServer != nil
         _ = try await transport.request("session/set_mode", .object(["sessionId": .string(id), "modeId": .string("approve")]))
         return id
     }
@@ -50,7 +52,7 @@ actor GooseACPClient {
         guard let session else { throw AgentError.unavailable }
         guard active == nil else { throw AgentError.busy }
         guard !input.isEmpty, input.count <= 16_000 else { throw AgentError.invalidMessage }
-        active = UUID(); text = ""; cost = nil; invalidUsage = false
+        active = UUID(); text = ""; cost = nil; invalidUsage = false; proposals.removeAll()
         defer { active = nil }
         do {
             let result = try await transport.request("session/prompt", .object([
@@ -82,6 +84,14 @@ actor GooseACPClient {
                 guard update["content"]["type"].string == "text", let chunk = update["content"]["text"].string,
                       text.utf8.count + chunk.utf8.count <= 262_144 else { await transport.close(); return }
                 text += chunk; emit(.text(chunk))
+            case "tool_call":
+                if allowsPlanning, proposals.count < 32,
+                   let id = update["toolCallId"].string,
+                   update["_meta"]["goose"]["toolCall"]["toolName"].string == "jarvis__propose_action",
+                   update["_meta"]["goose"]["toolCall"]["extensionName"].string == "jarvis",
+                   (try? AgentMCPBridge.decodeAction(update["rawInput"])) != nil {
+                    proposals[id] = update["rawInput"]
+                }
             case "usage_update":
                 guard update["cost"] != .null else { return }
                 guard update["cost"]["currency"].string == "USD", let decimal = update["cost"]["amount"].decimal,
@@ -94,13 +104,22 @@ actor GooseACPClient {
             guard message["id"] != .null else { return }
             let params = message["params"]
             var outcome: JSONValue = .object(["outcome": .string("cancelled")])
-            if active != nil, params["sessionId"].string == session,
-               let reject = params["options"].array?.first(where: { $0["kind"].string == "reject_once" }),
-               let id = reject["optionId"].string {
-                outcome = .object(["outcome": .string("selected"), "optionId": .string(id)])
+            var allowed = false
+            if active != nil, params["sessionId"].string == session {
+                let call = params["toolCall"]
+                if allowsPlanning, let callID = call["toolCallId"].string,
+                   let expected = proposals.removeValue(forKey: callID), expected == call["rawInput"],
+                   let option = params["options"].array?.first(where: { $0["kind"].string == "allow_once" }),
+                   let id = option["optionId"].string {
+                    outcome = .object(["outcome": .string("selected"), "optionId": .string(id)])
+                    allowed = true // Allows planning only, never execution or native confirmation.
+                } else if let reject = params["options"].array?.first(where: { $0["kind"].string == "reject_once" }),
+                          let id = reject["optionId"].string {
+                    outcome = .object(["outcome": .string("selected"), "optionId": .string(id)])
+                }
             }
             try? await transport.respond(id: message["id"], result: .object(["outcome": outcome]))
-            emit(.permissionRejected)
+            emit(allowed ? .proposalAllowed : .permissionRejected)
         default:
             if message["id"] != .null { try? await transport.reject(id: message["id"]) }
         }

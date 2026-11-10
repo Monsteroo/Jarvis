@@ -18,6 +18,19 @@ import Foundation
         check(try await ledger.snapshot().committed.micros == 250_162, "Interrupted usage reserves full ceiling")
         _ = try await runner.run(text: "invalid-cost", language: "en", apiKey: "test-only-not-a-key")
         check(try await ledger.snapshot().committed.micros == 500_162, "Unsupported currency not free")
+        let actionRunner = RunnerActionRecorder(), broker = AgentActionBroker(executor: actionRunner)
+        let turn = UUID()
+        let context = AgentPlanningContext(broker: broker, turn: turn,
+            helperExecutable: URL(fileURLWithPath: FileManager.default.currentDirectoryPath + "/.build/agent/jarvis-mcp-helper"))
+        let planned = try await runner.run(text: "proposal", language: "uk", apiKey: "test-only-not-a-key", planning: context)
+        check(planned.text == "plan proposed", "Budgeted planning path")
+        let proposals = await broker.pendingPlans()
+        let effectsBeforeApproval = await actionRunner.count
+        check(proposals.count == 1 && effectsBeforeApproval == 0, "Proposal survives normal process close without execution")
+        let approval = try await broker.approve(plan: proposals[0].id)
+        _ = try await broker.commit(plan: proposals[0].id, token: approval)
+        check(await actionRunner.count == 1, "Budgeted proposal commits only after native approval")
+        await broker.cancel(turn: turn)
         let turns = config.root.appendingPathComponent("turns")
         check(try FileManager.default.contentsOfDirectory(atPath: turns.path).isEmpty, "Turn state cleaned on success and failure")
         check(try Money.usd("0.25").micros == 250_000, "Exact decimal parsing")
@@ -48,4 +61,9 @@ actor MockLauncher: GooseLaunching {
         try await rpc.start(executable: URL(fileURLWithPath: "/usr/bin/python3"), arguments: [FileManager.default.currentDirectoryPath + "/Tests/Agent/mock-acp.py"], environment: ["PATH": "/usr/bin:/bin"])
         return GooseACPClient(transport: rpc)
     }
+}
+
+actor RunnerActionRecorder: TypedActionRunning {
+    private(set) var count = 0
+    func run(_ action: Action, language: String) async -> CommandOutcome { count += 1; return .done(summary: "ok") }
 }

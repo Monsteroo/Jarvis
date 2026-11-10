@@ -6,9 +6,12 @@ actor AgentMCPBridge {
     let broker: AgentActionBroker
     let turn: UUID
     private var initialized = false
+    private var closed = false
+    func close() { closed = true }
     init(broker: AgentActionBroker, turn: UUID) { self.broker = broker; self.turn = turn }
     func handle(_ message: JSONValue) async -> JSONValue? {
         let id = message["id"]
+        guard !closed, !Task.isCancelled else { return error(id, code: -32600) }
         guard message["jsonrpc"].string == "2.0", let method = message["method"].string else {
             return error(id, code: -32600)
         }
@@ -30,7 +33,7 @@ actor AgentMCPBridge {
             guard initialized else { return error(id, code: -32600) }
             do {
                 guard message["params"]["name"].string == "propose_action" else { throw AgentError.invalidMessage }
-                let action = try decodeAction(message["params"]["arguments"])
+                let action = try Self.decodeAction(message["params"]["arguments"])
                 let plan = try await broker.propose(action, turn: turn)
                 return toolResult(id, text: "Plan \(plan.id.uuidString) awaits native user review. No action executed.", failed: false)
             } catch { return toolResult(id, text: "Proposal rejected. No action executed.", failed: true) }
@@ -45,7 +48,7 @@ actor AgentMCPBridge {
                 "value": .object(["type": .string("integer"), "minimum": .number(-100), "maximum": .number(100)]),
                 "muted": .object(["type": .string("boolean")])])])
     }
-    private func decodeAction(_ args: JSONValue) throws -> Action {
+    static func decodeAction(_ args: JSONValue) throws -> Action {
         guard case .object(let fields) = args, let kind = args["kind"].string else { throw AgentError.invalidMessage }
         let action: Action, allowed: Set<String>
         switch kind {
