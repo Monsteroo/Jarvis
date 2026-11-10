@@ -15,6 +15,9 @@ struct TurnStages: Equatable {
     var audioSeconds: Double?
     var asrSeconds: Double?
     var responseSeconds: Double?
+    /// Real executor result for the recognised command; nothing simulated.
+    var action: StageState = .pending
+    var actionNote: String?
 }
 
 /// Main-thread UI state shared by the main window, HUD and status menu.
@@ -44,7 +47,51 @@ final class VoiceStore: ObservableObject {
     @Published var canSkipPrompt = false
     @Published var mainVisible = true
     @Published var hudVisible = false
+    /// Result of the last executed command (real executor outcome).
+    @Published var actionMessage = ""
     @Published var reduceMotion = false
+    /// Spoken replies (off = text only) and the chosen voice per language.
+    @Published var spokenReplies = UserDefaults.standard.object(forKey: "spokenReplies") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(spokenReplies, forKey: "spokenReplies") }
+    }
+    @Published var voiceUK = UserDefaults.standard.string(forKey: "voiceUK") ?? "" {
+        didSet { UserDefaults.standard.set(voiceUK, forKey: "voiceUK") }
+    }
+    @Published var voiceEN = UserDefaults.standard.string(forKey: "voiceEN") ?? "" {
+        didSet { UserDefaults.standard.set(voiceEN, forKey: "voiceEN") }
+    }
+    /// ElevenLabs voice (cloud, opt-in). Only reply text is sent.
+    /// On by default: without a saved key the macOS voice answers anyway.
+    @Published var cloudVoiceEnabled = UserDefaults.standard.object(forKey: "cloudVoiceEnabled") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(cloudVoiceEnabled, forKey: "cloudVoiceEnabled") }
+    }
+    @Published var elevenVoiceID = UserDefaults.standard.string(forKey: "elevenVoiceID") ?? "K74pMNmxBnAW8cPpeyph" {
+        didSet { UserDefaults.standard.set(elevenVoiceID, forKey: "elevenVoiceID") }
+    }
+    /// 0 = no limit of our own (default): ElevenLabs errors switch to the macOS voice.
+    @Published var cloudCharacterLimit = UserDefaults.standard.object(forKey: "cloudCharacterLimit") as? Int ?? 0 {
+        didSet { UserDefaults.standard.set(cloudCharacterLimit, forKey: "cloudCharacterLimit") }
+    }
+    @Published var hasCloudKey = false
+    @Published var cloudStatus = ""
+    @Published var cloudUsed = 0
+
+    func refreshCloudUsage() { cloudUsed = VoiceUsageLedger.load().used(at: Date()) }
+
+    @Published var voicesUK: [SpeechOutput.Voice] = []
+    @Published var voicesEN: [SpeechOutput.Voice] = []
+
+    /// Installed voices; a saved choice that is no longer installed falls back
+    /// to the first male voice (or the first voice when there is none).
+    func loadVoices() {
+        voicesUK = SpeechOutput.voices(for: "uk")
+        voicesEN = SpeechOutput.voices(for: "en")
+        if !voicesUK.contains(where: { $0.id == voiceUK }) { voiceUK = voicesUK.first?.id ?? "" }
+        if !voicesEN.contains(where: { $0.id == voiceEN }) {
+            voiceEN = (voicesEN.first { $0.male && $0.language == "en-GB" } ?? voicesEN.first)?.id ?? ""
+        }
+    }
+
     /// Quiet cue when "Jarvis" is recognised; the user can turn it off.
     @Published var acknowledgmentSound = UserDefaults.standard.object(forKey: "acknowledgmentSound") as? Bool ?? true {
         didSet { UserDefaults.standard.set(acknowledgmentSound, forKey: "acknowledgmentSound") }
@@ -67,7 +114,8 @@ final class VoiceStore: ObservableObject {
         case .transcribing: return "Розпізнаю"
         case .result: return emptyResult ? "Мовлення не знайдено" : "Розпізнано"
         case .error: return "Помилка"
-        case .executing, .speaking: return "Недоступно"
+        case .speaking: return "Говорю"
+        case .executing: return "Недоступно"
         }
     }
 
@@ -86,6 +134,7 @@ final class VoiceStore: ObservableObject {
 
     var detail: String {
         if !machine.message.isEmpty && !machine.busy { return machine.message }
+        if !actionMessage.isEmpty && !machine.busy { return actionMessage }
         if !wakeError.isEmpty && !machine.busy { return wakeError }
         switch phase {
         case .loadingModel: return "Parakeet завантажується в пам’ять цього Mac. Запис поки недоступний."
@@ -109,7 +158,8 @@ final class VoiceStore: ObservableObject {
                 : (machine.wakeEnabled ? "Запис команди завершено. Розпізнаю на цьому Mac…" : "Мікрофон вимкнено. Розпізнаю на цьому Mac…")
         case .result: return machine.wakeEnabled ? "Скажіть «Jarvis» або утримуйте ⌃⌥Пробіл для наступної фрази." : "Утримуйте ⌃⌥Пробіл для наступної фрази."
         case .error: return "Спробуйте ще раз."
-        case .executing, .speaking: return ""
+        case .speaking: return "Esc — зупинити. Поки я говорю, «Jarvis» не слухається."
+        case .executing: return ""
         }
     }
 
@@ -133,6 +183,9 @@ struct VoiceActions {
     var revealDiagnostic: () -> Void = {}
     var setMeasuring: (Bool) -> Void = { _ in }
     var skipPrompt: () -> Void = {}
+    var previewVoice: (String) -> Void = { _ in }
+    var saveCloudKey: (String) -> Void = { _ in }
+    var deleteCloudKey: () -> Void = {}
     var openMicrophoneSettings: () -> Void = {}
 }
 
@@ -410,7 +463,7 @@ struct AssistantView: View {
     private var commandField: some View {
         HStack(spacing: 12) {
             Image(systemName: "waveform").foregroundStyle(ArcPalette.cyan)
-            Text("Текстові команди з’являться разом із виконавцем дій")
+            Text("Текстові команди з’являться згодом; зараз — голосом")
                 .font(.system(size: 14)).foregroundStyle(ArcPalette.secondary.opacity(0.7))
                 .lineLimit(1)
             Spacer()
@@ -439,19 +492,8 @@ struct StagesRow: View {
             stage("Розпізнавання", "text.magnifyingglass", s.recognize, s.asrSeconds.map { String(format: "ASR %.2f с", $0) })
             connector(s.recognize == .done)
             stage("Текст", "text.quote", s.text, s.responseSeconds.map { String(format: "відповідь %.2f с", $0) })
-            connector(false)
-            HStack(spacing: 10) {
-                Image(systemName: "gearshape.2").font(.system(size: 18))
-                    .frame(width: 40, height: 40)
-                    .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(ArcPalette.secondary.opacity(0.25), style: StrokeStyle(lineWidth: 1, dash: [3, 3])))
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Виконання дій").font(.system(size: 14, weight: .medium))
-                    Text("ще не підключено").font(.system(size: 11))
-                }
-                .lineLimit(1).fixedSize()
-            }
-            .foregroundStyle(ArcPalette.secondary.opacity(0.55))
-            .accessibilityElement(children: .combine)
+            connector(s.text == .done)
+            stage("Виконання дій", "gearshape.2", s.action, s.actionNote)
         }
         .padding(.horizontal, 18).padding(.vertical, 14)
         .glass(radius: 18)
@@ -518,6 +560,13 @@ struct DiagnosticsView: View {
                     }
                     note("Ліміт запису: \(store.recordLimit) с. Parakeet UK — модель за замовчуванням; Whisper — резервні варіанти.")
                 }
+                section("Голос відповідей") {
+                    Toggle("Відповідати голосом (вимкнено — лише текст)", isOn: $store.spokenReplies)
+                    CloudVoiceSettings(store: store, actions: actions)
+                    voiceRow("Українська", selection: $store.voiceUK, voices: store.voicesUK, language: "uk")
+                    voiceRow("English", selection: $store.voiceEN, voices: store.voicesEN, language: "en")
+                    note("Голоси macOS, локально на цьому Mac. Українського чоловічого голосу в macOS немає — локальний нейроголос буде окремим кроком. Якісніші англійські голоси (Enhanced/Premium): Системні параметри → Універсальний доступ → Усний вміст → Системний голос → Керувати голосами; після завантаження перезапустіть Jarvis.")
+                }
                 section("Активація «Jarvis»") {
                     Toggle("Тихий звук, коли Jarvis почув слово активації", isOn: $store.acknowledgmentSound)
                     note("Звук синтезується на цьому Mac і не записується.")
@@ -558,6 +607,18 @@ struct DiagnosticsView: View {
             }
             .padding(28)
             .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    private func voiceRow(_ title: String, selection: Binding<String>, voices: [SpeechOutput.Voice], language: String) -> some View {
+        HStack {
+            Picker(title, selection: selection) {
+                ForEach(voices) { Text($0.label).tag($0.id) }
+            }
+            .frame(width: 420)
+            .disabled(voices.isEmpty)
+            Button("Прослухати") { actions.previewVoice(language) }
+                .disabled(voices.isEmpty || store.machine.busy)
         }
     }
 
@@ -608,5 +669,50 @@ struct HUDView: View {
         .background(Capsule().fill(ArcPalette.background.opacity(0.92)))
         .overlay(Capsule().strokeBorder(ArcPalette.cyan.opacity(0.28), lineWidth: 1))
         .preferredColorScheme(.dark)
+    }
+}
+
+
+/// ElevenLabs settings: opt-in toggle, voice ID, key into Keychain, monthly limit.
+struct CloudVoiceSettings: View {
+    @ObservedObject var store: VoiceStore
+    let actions: VoiceActions
+    @State private var key = ""
+
+    private let limits = [0, 20_000, 50_000, 100_000, 200_000]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Toggle("Голос ElevenLabs (хмара; без інтернету чи ключа — голос macOS)", isOn: $store.cloudVoiceEnabled)
+            HStack {
+                Text("ID голосу")
+                TextField("ID", text: $store.elevenVoiceID).frame(width: 260).font(.system(size: 12).monospaced())
+            }
+            HStack {
+                if store.hasCloudKey {
+                    Text("Ключ API збережено").foregroundStyle(ArcPalette.secondary)
+                    Button("Видалити ключ", action: actions.deleteCloudKey)
+                } else {
+                    SecureField("Ключ API ElevenLabs", text: $key).frame(width: 260)
+                    Button("Зберегти в Keychain") { actions.saveCloudKey(key); key = "" }.disabled(key.isEmpty)
+                }
+            }
+            HStack {
+                Picker("Ліміт на місяць", selection: $store.cloudCharacterLimit) {
+                    ForEach(limits, id: \.self) { limit in
+                        Text(limit == 0 ? "Без власного ліміту" : String(format: "%d тис. знаків (≈ $%.0f)", limit / 1000, Double(limit) / 1000 * ElevenLabsRequest.pricePerThousand)).tag(limit)
+                    }
+                }
+                .frame(width: 340)
+            }
+            Text(String(format: "Цього місяця: %d знаків (≈ $%.2f за прайсом Flash v2.5).", store.cloudUsed,
+                        Double(store.cloudUsed) / 1000 * ElevenLabsRequest.pricePerThousand))
+                .font(.system(size: 12).monospacedDigit()).foregroundStyle(ArcPalette.secondary)
+            if !store.cloudStatus.isEmpty {
+                Text(store.cloudStatus).font(.system(size: 12)).foregroundStyle(ArcPalette.secondary)
+            }
+            Text("ElevenLabs отримує лише текст відповіді; звук мікрофона не надсилається. Мова задається явно (uk або en). Будь-яка помилка ElevenLabs (кредити, ключ, мережа, понад 5 с очікування) — і відповідає голос macOS.")
+                .font(.system(size: 12)).foregroundStyle(ArcPalette.secondary).fixedSize(horizontal: false, vertical: true)
+        }
     }
 }

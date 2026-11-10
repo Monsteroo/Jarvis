@@ -14,13 +14,13 @@ enum VoicePhase: Equatable {
     case error
     /// Idle with voice activation armed: waiting for the word "Jarvis".
     case wakeListening
-    // Reserved for later stages. The machine never enters these until the
-    // executor and TTS are integrated.
-    case executing
+    /// A spoken reply is playing; wake detection is paused meanwhile.
     case speaking
+    // Reserved until the action executor is integrated.
+    case executing
 
     /// Future capabilities that must never be presented as working yet.
-    static let unavailable: Set<VoicePhase> = [.executing, .speaking]
+    static let unavailable: Set<VoicePhase> = [.executing]
 }
 
 enum ModelStatus: Equatable { case loading, ready, failed }
@@ -37,11 +37,13 @@ struct VoiceMachine: Equatable {
     private(set) var transcript = ""
     private(set) var message = ""
     private(set) var timedOut = false
+    /// Jarvis is speaking: the wake detector must not listen (self-trigger).
+    private(set) var speaking = false
 
     var busy: Bool { phase == .recording || phase == .transcribing }
     var canRecord: Bool { microphoneEnabled && model == .ready && !busy }
     /// The wake detector may listen only in this state.
-    var wakeArmed: Bool { wakeEnabled && canRecord }
+    var wakeArmed: Bool { wakeEnabled && canRecord && !speaking }
 
     mutating func modelLoading() {
         invalidate()
@@ -105,6 +107,22 @@ struct VoiceMachine: Equatable {
         return true
     }
 
+    /// Starts a spoken reply. Not while recording or transcribing.
+    @discardableResult
+    mutating func beginSpeaking() -> Bool {
+        guard !busy else { return false }
+        speaking = true
+        phase = .speaking
+        return true
+    }
+
+    /// Speech ended or was stopped. The transcript and message stay visible.
+    mutating func finishSpeaking() {
+        guard speaking else { return }
+        speaking = false
+        if phase == .speaking { settle() }
+    }
+
     /// Too-short audio and similar non-errors: return to idle with a hint.
     mutating func abandon(turn id: Int, message: String) {
         guard id == turn, busy else { return }
@@ -129,6 +147,7 @@ struct VoiceMachine: Equatable {
 
     private mutating func invalidate() {
         if busy { turn += 1 }
+        speaking = false
         phase = .ready // temporary; settle() picks the real idle phase
     }
 
@@ -136,7 +155,7 @@ struct VoiceMachine: Equatable {
         switch model {
         case .loading: phase = .loadingModel
         case .failed: phase = .modelUnavailable
-        case .ready: phase = microphoneEnabled ? (wakeEnabled ? .wakeListening : .ready) : .microphoneOff
+        case .ready: phase = speaking ? .speaking : (microphoneEnabled ? (wakeEnabled ? .wakeListening : .ready) : .microphoneOff)
         }
     }
 }

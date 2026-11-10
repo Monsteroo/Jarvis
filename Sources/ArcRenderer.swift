@@ -11,7 +11,7 @@ enum FilamentMode: Equatable {
     init(_ phase: VoicePhase, microphoneEnabled: Bool) {
         switch phase {
         case .recording: self = .listening
-        case .transcribing: self = .thinking
+        case .transcribing, .speaking: self = .thinking
         case .microphoneOff: self = .off
         default: self = microphoneEnabled ? .idle : .off
         }

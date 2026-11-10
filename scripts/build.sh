@@ -41,6 +41,13 @@ swiftc "${SWIFT_FLAGS[@]}" -swift-version 5 -Onone -parse-as-library Sources/Mea
 .build/measurement-tests
 swiftc "${SWIFT_FLAGS[@]}" -swift-version 5 -Onone -parse-as-library Sources/Diagnostic.swift Tests/DiagnosticTests.swift -o .build/diagnostic-tests
 swiftc "${SWIFT_FLAGS[@]}" -swift-version 5 -Onone -parse-as-library Sources/Acknowledgment.swift Tests/AcknowledgmentTests.swift -o .build/acknowledgment-tests
+swiftc "${SWIFT_FLAGS[@]}" -swift-version 5 -Onone -parse-as-library Sources/TranscriptCleanup.swift Tests/TranscriptCleanupTests.swift -o .build/transcript-cleanup-tests
+swiftc "${SWIFT_FLAGS[@]}" -swift-version 5 -Onone -parse-as-library Sources/CloudVoice.swift Tests/CloudVoiceTests.swift -o .build/cloud-voice-tests
+# ChatGPT's action and agent modules: their own scripts and overlays.
+bash scripts/test-actions.sh
+bash scripts/test-agent.sh
+.build/cloud-voice-tests
+.build/transcript-cleanup-tests
 .build/acknowledgment-tests
 .build/diagnostic-tests
 swiftc "${SWIFT_FLAGS[@]}" -swift-version 5 -O -parse-as-library Sources/Parakeet.swift Tests/ParakeetTests.swift -o .build/parakeet-tests
@@ -77,7 +84,7 @@ fi
 if [[ -f Sources/App.swift ]]; then
 APP="$ROOT/dist/Jarvis Voice Lab.app"
 mkdir -p "$APP/Contents/MacOS"
-swiftc "${SWIFT_FLAGS[@]}" -swift-version 5 -O -parse-as-library -import-objc-header Sources/Bridging.h Sources/App.swift Sources/Audio.swift Sources/AudioMetrics.swift Sources/VoiceState.swift Sources/ArcRenderer.swift Sources/ArcViews.swift Sources/WakeSupport.swift Sources/WakeListener.swift Sources/Measurement.swift Sources/Diagnostic.swift Sources/Acknowledgment.swift Sources/Parakeet.swift .build/WhisperBridge.o .build/WakeBridge.o "${LIBS[@]}" "${WAKE_LIBS[@]}" "${FRAMEWORKS[@]}" -framework AppKit -framework SwiftUI -framework AVFoundation -framework Carbon -lc++ -o "$APP/Contents/MacOS/JarvisVoiceLab"
+swiftc "${SWIFT_FLAGS[@]}" -swift-version 5 -O -parse-as-library -import-objc-header Sources/Bridging.h Sources/App.swift Sources/Audio.swift Sources/AudioMetrics.swift Sources/VoiceState.swift Sources/ArcRenderer.swift Sources/ArcViews.swift Sources/WakeSupport.swift Sources/WakeListener.swift Sources/Measurement.swift Sources/Diagnostic.swift Sources/Acknowledgment.swift Sources/TranscriptCleanup.swift Sources/SpeechOutput.swift Sources/Actions/*.swift Sources/CloudVoice.swift Sources/Parakeet.swift .build/WhisperBridge.o .build/WakeBridge.o "${LIBS[@]}" "${WAKE_LIBS[@]}" "${FRAMEWORKS[@]}" -framework AppKit -framework SwiftUI -framework AVFoundation -framework Carbon -framework ApplicationServices -framework CoreAudio -lc++ -o "$APP/Contents/MacOS/JarvisVoiceLab"
 python3 - "$APP/Contents/Info.plist" "$ROOT" <<'PY'
 import plistlib,sys
 with open(sys.argv[1],'wb') as f:

@@ -231,6 +231,9 @@ final class JarvisApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             revealDiagnostic: { [weak self] in self?.revealDiagnostic() },
             setMeasuring: { [weak self] in self?.setMeasuring($0) },
             skipPrompt: { [weak self] in self?.skipPrompt() },
+            previewVoice: { [weak self] in self?.previewVoice($0) },
+            saveCloudKey: { [weak self] in self?.saveCloudKey($0) },
+            deleteCloudKey: { [weak self] in self?.deleteCloudKey() },
             openMicrophoneSettings: {
                 NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone")!)
             })
@@ -244,6 +247,12 @@ final class JarvisApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         makeHUD()
         makeStatusItem()
         registerHotKey()
+        voice.onFinish = { [weak self] in self?.speechEnded() }
+        voice.onCloudResult = { [weak self] in self?.cloudResult($0, characters: $1, seconds: $2) }
+        store.hasCloudKey = ProcessInfo.processInfo.environment["ELEVENLABS_API_KEY"] != nil
+            || KeychainSecret.read(KeychainSecret.elevenLabs) != nil
+        store.refreshCloudUsage()
+        store.loadVoices()
         audio.onLimit = { [weak self] in self?.finishRecording(timedOut: true) }
         audio.onFailure = { [weak self] error in
             guard let self else { return }
@@ -290,6 +299,81 @@ final class JarvisApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private let chime = AcknowledgmentSound()
+
+    // MARK: Actions (ChatGPT's ActionExecutor, one instance)
+
+    private lazy var executor: ActionExecutor = MainActor.assumeIsolated {
+        ActionExecutor.live(history: try? HistoryStore())
+    }
+    private var commandTask: Task<Void, Never>?
+    /// One-use token for the text field that was focused when the turn began.
+    private var dictationToken: UUID?
+
+    /// Before the HUD appears: remember the focused text field for dictation.
+    private func captureFocus() {
+        dictationToken = MainActor.assumeIsolated { try? executor.captureDictationTarget() }
+        wakeTrace("focus field=\(dictationToken != nil)") // a flag only, no app names or text
+    }
+
+    private func cancelCommand() {
+        commandTask?.cancel()
+        commandTask = nil
+    }
+
+    /// Runs a recognised command through the typed executor and reports the
+    /// real outcome. A newer turn or cancel makes a late result invisible.
+    private func runCommand(_ text: String, turn id: Int, language: String) {
+        cancelCommand()
+        guard !text.isEmpty else { return }
+        let token = dictationToken
+        dictationToken = nil
+        store.stages.action = .active
+        store.stages.actionNote = nil
+        let executor = self.executor
+        let started = ProcessInfo.processInfo.systemUptime
+        commandTask = Task { @MainActor [weak self] in
+            let outcome = await executor.handle(text, language: language, dictationToken: token)
+            guard let self, !Task.isCancelled, self.store.machine.turn == id, !self.store.machine.busy else { return }
+            self.commandTask = nil
+            self.present(outcome, language: language, seconds: ProcessInfo.processInfo.systemUptime - started)
+        }
+    }
+
+    private func present(_ outcome: CommandOutcome, language: String, seconds: Double) {
+        let en = language == "en"
+        let spoken: String
+        switch outcome {
+        case .done(let summary):
+            store.stages.action = .done
+            store.stages.actionNote = String(format: "%.2f с", seconds)
+            store.actionMessage = summary
+            spoken = summary
+        case .partial(let summary, let details):
+            store.stages.action = .failed
+            store.stages.actionNote = en ? "partly" : "частково"
+            store.actionMessage = summary + " " + details
+            spoken = summary + " " + details
+        case .failed(let reason):
+            store.stages.action = .failed
+            store.stages.actionNote = en ? "failed" : "не виконано"
+            store.actionMessage = reason
+            spoken = reason
+        case .needsApproval:
+            // No action in the current registry asks for approval; never auto-approve.
+            store.stages.action = .failed
+            store.stages.actionNote = en ? "needs approval" : "потрібне підтвердження"
+            store.actionMessage = en ? "This action needs confirmation, which is not connected yet." : "Ця дія потребує підтвердження, яке ще не підключено."
+            spoken = store.actionMessage
+        case .notUnderstood:
+            store.stages.action = .failed
+            store.stages.actionNote = en ? "not understood" : "не зрозумів"
+            store.actionMessage = en ? "I don't know this command yet. Try “open Safari” or “volume up”."
+                                     : "Поки не знаю такої команди. Спробуйте «відкрий Safari» або «зроби гучніше»."
+            spoken = en ? "I don't know this command yet." : "Поки не знаю такої команди."
+        }
+        wakeTrace(String(format: "action %@ %.2f s", "\(outcome)".prefix(12).description, seconds))
+        speak(spoken, language: language)
+    }
 
     private func observe(_ center: NotificationCenter, _ name: Notification.Name, _ handler: @escaping (JarvisApp) -> Void) {
         let token = center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
@@ -450,7 +534,7 @@ final class JarvisApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             wake.setMode(.off)
         }
         switch machine.phase {
-        case .recording, .transcribing: showHUD()
+        case .recording, .transcribing, .speaking: showHUD()
         case .microphoneOff: hideHUD(after: 1.2)
         default: hideHUD(after: 3.5)
         }
@@ -505,7 +589,9 @@ final class JarvisApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let app = Unmanaged<JarvisApp>.fromOpaque(userData).takeUnretainedValue()
             let pressed = GetEventKind(event) == UInt32(kEventHotKeyPressed)
             if identifier.id == 1 { pressed ? app.keyDown() : app.keyUp() }
-            if (identifier.id == 2 || identifier.id == 3) && pressed { app.cancelSession(message: "Скасовано. Запис зупинено, результат відкинуто.") }
+            if (identifier.id == 2 || identifier.id == 3) && pressed {
+                if app.store.machine.speaking { app.stopSpeaking() } else { app.cancelSession(message: "Скасовано. Запис зупинено, результат відкинуто.") }
+            }
             return noErr
         }, events.count, &events, Unmanaged.passUnretained(self).toOpaque(), &eventHandler)
         guard handlerStatus == noErr else { store.hotKeyAvailable = false; return }
@@ -567,6 +653,7 @@ final class JarvisApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func keyDown() {
+        stopSpeaking() // PTT interrupts a spoken reply
         let authorized = AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
         guard gate.press(enabled: store.machine.microphoneEnabled, authorized: authorized,
                          ready: store.machine.canRecord && store.hotKeyAvailable) else { return }
@@ -584,6 +671,9 @@ final class JarvisApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     /// Shared by PTT and wake-started turns once audio is being recorded.
     private func beginTurnUI(_ id: Int) {
+        cancelCommand()
+        store.actionMessage = ""
+        captureFocus()
         screenToken += 1   // a pending screening result must not start a second turn
         screenPending = nil
         turn = id
@@ -673,7 +763,9 @@ final class JarvisApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
             // Stale results of cancelled turns are dropped by both LocalSpeech
             // generations and the turn id.
-            guard self.store.machine.finishTranscription(turn: id, text: text) else { return }
+            // Shown and passed on in clean Ukrainian; measurements keep the raw ASR text.
+            let shown = text.map { TranscriptCleanup.normalize($0, language: code) }
+            guard self.store.machine.finishTranscription(turn: id, text: shown) else { return }
             let responseTime = ProcessInfo.processInfo.systemUptime - releasedAt
             self.turn = nil
             self.disableEscape()
@@ -681,6 +773,8 @@ final class JarvisApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self.store.stages.responseSeconds = responseTime
             self.store.stages.recognize = text == nil ? .failed : .done
             self.store.stages.text = (text?.isEmpty ?? true) ? .failed : .done
+            // Measurement prompts and diagnostic recordings are never executed.
+            if measured == nil, !wasDiagnostic, let shown, !shown.isEmpty { self.runCommand(shown, turn: id, language: code) }
             if let measured {
                 let status: MeasurementRecord.Status = text == nil ? .error : (text!.isEmpty ? .empty : .ok)
                 self.logMeasurement(measured, model: measuredModel, languageSetting: code, transcript: text ?? "",
@@ -697,6 +791,11 @@ final class JarvisApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func cancelSession(message: String) {
+        cancelCommand()
+        MainActor.assumeIsolated { executor.invalidateDictationTarget() }
+        dictationToken = nil
+        voice.stop()
+        speechToken += 1
         gate.cancel()
         if diagnostic.armed {
             diagnostic.cancel()
@@ -712,6 +811,100 @@ final class JarvisApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         turn = nil
         if store.stages.record == .active || store.stages.recognize == .active { store.stages = TurnStages() }
         store.machine.cancel(message: message)
+    }
+
+    // MARK: Spoken replies
+
+    private let voice = SpeechOutput()
+    private var speechToken = 0
+
+    /// Speaks a short reply with the chosen voice. Wake detection is paused
+    /// for the whole reply and a short tail, so Jarvis never hears itself.
+    func speak(_ text: String, language: String) {
+        guard store.spokenReplies, !store.machine.busy else { return }
+        let voiceID = language == "en" ? store.voiceEN : store.voiceUK
+        guard store.machine.beginSpeaking() else { return }
+        speechToken += 1
+        enableEscape()
+        showHUD()
+        if !voice.speak(text, language: language, localVoiceID: voiceID, cloud: cloudPlan()) {
+            store.machine.finishSpeaking()
+            disableEscape()
+        }
+    }
+
+    func stopSpeaking() {
+        guard store.machine.speaking else { return }
+        speechToken += 1
+        voice.stop()
+        store.machine.finishSpeaking()
+        disableEscape()
+    }
+
+    private func speechEnded() {
+        speechToken += 1
+        let token = speechToken
+        // Room echo of the last syllable must not reach the detector.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+            guard let self, token == self.speechToken, self.store.machine.speaking else { return }
+            self.store.machine.finishSpeaking()
+            self.disableEscape()
+        }
+    }
+
+    private var cachedCloudKey: String?
+
+    /// ElevenLabs only when the user enabled it and a key exists (environment
+    /// variable or Keychain). The key is read once and kept in memory.
+    private func cloudPlan() -> SpeechOutput.CloudPlan? {
+        guard store.cloudVoiceEnabled else {
+            store.cloudStatus = "ElevenLabs вимкнено перемикачем — відповідає голос macOS."
+            return nil
+        }
+        if cachedCloudKey == nil {
+            cachedCloudKey = ProcessInfo.processInfo.environment["ELEVENLABS_API_KEY"] ?? KeychainSecret.read(KeychainSecret.elevenLabs)
+        }
+        guard let key = cachedCloudKey, !key.isEmpty else {
+            store.cloudStatus = "Немає ключа ElevenLabs — відповідає голос macOS."
+            return nil
+        }
+        return SpeechOutput.CloudPlan(voiceID: store.elevenVoiceID, apiKey: key, monthlyCharacterLimit: store.cloudCharacterLimit)
+    }
+
+    private func cloudResult(_ reason: String?, characters: Int, seconds: Double) {
+        store.refreshCloudUsage()
+        store.cloudStatus = reason.map { "Відповів голос macOS: \($0)." }
+            ?? String(format: "Відповів ElevenLabs, звук отримано за %.2f с.", seconds)
+        wakeTrace(String(format: "cloud tts %@ chars=%d %.2f s", reason == nil ? "ok" : "fallback", characters, seconds))
+    }
+
+    private func saveCloudKey(_ key: String) {
+        let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        if KeychainSecret.save(trimmed, KeychainSecret.elevenLabs) {
+            cachedCloudKey = trimmed
+            voice.resetCloudPause()
+            store.hasCloudKey = true
+            store.cloudVoiceEnabled = true // saving a key means "use ElevenLabs"
+            store.cloudStatus = "Ключ збережено в Keychain."
+        } else {
+            store.cloudStatus = "Не вдалося зберегти ключ у Keychain."
+        }
+    }
+
+    private func deleteCloudKey() {
+        KeychainSecret.delete(KeychainSecret.elevenLabs)
+        cachedCloudKey = nil
+        store.hasCloudKey = ProcessInfo.processInfo.environment["ELEVENLABS_API_KEY"] != nil
+        store.cloudStatus = "Ключ видалено з Keychain."
+    }
+
+    private func previewVoice(_ language: String) {
+        if store.machine.speaking { stopSpeaking() }
+        let wasEnabled = store.spokenReplies
+        store.spokenReplies = true // preview works even in text-only mode
+        speak(SpeechOutput.sample(for: language), language: language)
+        store.spokenReplies = wasEnabled
     }
 
     // MARK: Voice activation
@@ -843,6 +1036,9 @@ final class JarvisApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// The whole «Джарвіс, <команда>» phrase was already heard and recognised.
     private func presentScreenedCommand(_ text: String, segment: Segment, asrSeconds: Double) {
         guard let id = store.machine.beginRecording() else { return }
+        cancelCommand()
+        store.actionMessage = ""
+        captureFocus()
         source = .wake
         screenPending = nil
         store.stages = TurnStages(record: .done, recognize: .done, text: .done,
@@ -850,8 +1046,10 @@ final class JarvisApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                   asrSeconds: asrSeconds,
                                   responseSeconds: ProcessInfo.processInfo.systemUptime - segment.heardAt)
         store.machine.beginTranscribing(turn: id, timedOut: false)
-        _ = store.machine.finishTranscription(turn: id, text: text)
+        let command = TranscriptCleanup.normalize(text, language: languageCode)
+        _ = store.machine.finishTranscription(turn: id, text: command)
         acknowledge()
+        runCommand(command, turn: id, language: languageCode)
     }
 
     private func acknowledge() {

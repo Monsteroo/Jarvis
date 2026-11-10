@@ -82,9 +82,8 @@ struct VoiceStateTests {
         check(m.phase == .error && !m.busy, "Capture failure ends the turn")
 
         // Future capabilities are never reachable.
-        for phase in [VoicePhase.executing, .speaking] {
-            check(VoicePhase.unavailable.contains(phase), "Future phase is marked unavailable")
-        }
+        check(VoicePhase.unavailable.contains(.executing), "Executing stays unavailable until actions exist")
+        check(!VoicePhase.unavailable.contains(.speaking), "Speaking is a real phase now")
         check(!VoicePhase.unavailable.contains(.wakeListening), "Wake listening is now a real phase")
 
         // Voice activation by "Jarvis".
@@ -122,6 +121,29 @@ struct VoiceStateTests {
         check(!w.wakeArmed && w.phase == .loadingModel, "No wake listening while the model reloads")
         w.modelLoaded(true)
         check(w.phase == .wakeListening, "Wake listening resumes after the model loads")
+
+        // Spoken replies pause wake detection (no self-trigger).
+        var t = VoiceMachine()
+        t.modelLoaded(true)
+        t.setMicrophone(enabled: true)
+        t.setWake(enabled: true)
+        let reply = t.beginRecording()!
+        check(!t.beginSpeaking(), "No speaking while recording")
+        t.beginTranscribing(turn: reply, timedOut: false)
+        t.finishTranscription(turn: reply, text: "Відкрий браузер")
+        check(t.beginSpeaking() && t.phase == .speaking && t.speaking, "Speaking after a result")
+        check(!t.wakeArmed, "Wake is not armed while Jarvis speaks")
+        check(t.transcript == "Відкрий браузер", "Transcript stays visible while speaking")
+        t.finishSpeaking()
+        check(!t.speaking && t.phase == .wakeListening && t.wakeArmed, "Wake resumes after speech")
+        t.finishSpeaking()
+        check(t.phase == .wakeListening, "A second finish is harmless")
+        t.beginSpeaking()
+        t.cancel(message: "Зупинено.")
+        check(!t.speaking && t.wakeArmed, "Cancel stops speaking state")
+        t.beginSpeaking()
+        t.setMicrophone(enabled: false)
+        check(!t.speaking && t.phase == .microphoneOff, "Mic-off clears speaking")
         print("VoiceStateTests: \(count) state assertions passed")
     }
 }
