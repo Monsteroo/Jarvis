@@ -1,0 +1,126 @@
+import Foundation
+
+actor ActionEvents {
+    private var listeners: [UUID: AsyncStream<ActionEvent>.Continuation] = [:]
+    func subscribe() -> AsyncStream<ActionEvent> {
+        let id = UUID()
+        return AsyncStream(bufferingPolicy: .bufferingNewest(32)) { continuation in
+            listeners[id] = continuation
+            continuation.onTermination = { [weak self] _ in Task { await self?.remove(id) } }
+        }
+    }
+    private func remove(_ id: UUID) { listeners.removeValue(forKey: id) }
+    func emit(_ event: ActionEvent) { for listener in listeners.values { listener.yield(event) } }
+}
+
+final class ActionExecutor: CommandHandling {
+    private let workspace: ActionWorkspace
+    private let windows: WindowActions?
+    private let audioOutput: AudioOutputActions?
+    private let dictation: DictationActions?
+    private let history: HistoryStore?
+    private let parser = IntentParser()
+    private let registry = ActionRegistry()
+    let events = ActionEvents()
+
+    init(workspace: ActionWorkspace, windows: WindowActions? = nil, audioOutput: AudioOutputActions? = nil, dictation: DictationActions? = nil, history: HistoryStore? = nil) {
+        self.workspace = workspace; self.windows = windows; self.audioOutput = audioOutput
+        self.dictation = dictation; self.history = history
+    }
+    @MainActor static func live(aliases: AppAliases = .defaults, history: HistoryStore? = nil) -> ActionExecutor {
+        ActionExecutor(workspace: MacActionWorkspace(aliases: aliases), windows: WindowActions(access: MacWindowAccess()), audioOutput: AudioOutputActions(access: MacOutputAccess()), dictation: DictationActions(access: MacDictationAccess()), history: history)
+    }
+
+    @MainActor func captureDictationTarget() throws -> UUID {
+        guard let dictation else { throw DeviceActionError.unavailable }
+        return try dictation.capture()
+    }
+    @MainActor func invalidateDictationTarget() { dictation?.invalidate() }
+
+    func handle(_ text: String, language: String) async -> CommandOutcome {
+        await handle(text, language: language, dictationToken: nil)
+    }
+    func handle(_ text: String, language: String, dictationToken: UUID?) async -> CommandOutcome {
+        guard language == "uk" || language == "en" else {
+            return .failed(reason: "Оберіть українську або англійську мову.")
+        }
+        guard !Task.isCancelled else { return cancelled(language) }
+        guard let action = parser.parse(text, language: language) else { return .notUnderstood }
+        return await handle(action: action, language: language, dictationToken: dictationToken)
+    }
+    /// Typed callers still pass through the same language/schema/cancellation gates.
+    func handle(action: Action, language: String, dictationToken: UUID? = nil) async -> CommandOutcome {
+        guard language == "uk" || language == "en" else { return .failed(reason: "Оберіть українську або англійську мову.") }
+        guard !Task.isCancelled else { return cancelled(language) }
+        do { try registry.validate(action) }
+        catch { return .failed(reason: actionText(language, "Некоректні параметри команди.", "Invalid command parameters.")) }
+        let turnID = UUID()
+        await events.emit(ActionEvent(turnID: turnID, action: action, phase: .started))
+        let started = ProcessInfo.processInfo.systemUptime
+        var result: CommandOutcome
+        do {
+            try Task.checkCancellation()
+            result = try await execute(action, language: language, dictationToken: dictationToken)
+        } catch is CancellationError { result = cancelled(language) }
+        catch { result = .failed(reason: actionText(language, "Не вдалося виконати дію. Перевірте програму й повторіть спробу.", "The action failed. Check the application and try again.")) }
+        if let history {
+            do { try await history.record(action: action, outcome: result, duration: ProcessInfo.processInfo.systemUptime - started) }
+            catch {
+                let warning = actionText(language, "Не вдалося зберегти історію.", "History could not be saved.")
+                switch result {
+                case .done(let summary): result = .partial(summary: summary, details: warning)
+                case .partial(let summary, let details): result = .partial(summary: summary, details: details + " " + warning)
+                case .failed(let reason): result = .failed(reason: reason + " " + warning)
+                default: break
+                }
+            }
+        }
+        await events.emit(ActionEvent(turnID: turnID, action: action, phase: .finished(result)))
+        return result
+    }
+
+    private func cancelled(_ language: String) -> CommandOutcome {
+        .failed(reason: actionText(language, "Запит скасовано. Уже розпочата дія могла виконатися.", "Request cancelled. An action already started may have completed."))
+    }
+    private func execute(_ action: Action, language: String, dictationToken: UUID?) async throws -> CommandOutcome {
+        switch action {
+        case .openApp(let name), .activateApp(let name), .quitApp(let name):
+            guard let url = await workspace.resolveApplication(name) else {
+                return .failed(reason: actionText(language, "Програму «\(name)» не знайдено. Уточніть назву.", "Application ‘\(name)’ was not found. Check its name."))
+            }
+            try Task.checkCancellation()
+            let success: Bool
+            let summary: String
+            switch action {
+            case .openApp:
+                success = try await workspace.openApplication(url)
+                summary = actionText(language, "Програму «\(name)» відкрито.", "Opened ‘\(name)’." )
+            case .activateApp:
+                success = try await workspace.activateApplication(url)
+                summary = actionText(language, "Програму «\(name)» активовано.", "Activated ‘\(name)’." )
+            default:
+                success = try await workspace.quitApplication(url)
+                summary = actionText(language, "Програму «\(name)» закрито.", "Closed ‘\(name)’." )
+            }
+            return success ? .done(summary: summary) : .failed(reason: actionText(language, "Програма не підтвердила дію. Перевірте, чи немає відкритого діалогу або незбережених змін.", "The application did not confirm the action. Check for dialogs or unsaved changes."))
+        case .openURL(let raw):
+            return try await openWeb(WebActions.validatedURL(raw), language: language)
+        case .webSearch(let query):
+            return try await openWeb(WebActions.searchURL(query), language: language)
+        case .windowMinimize, .windowMaximize, .windowLeftHalf, .windowRightHalf:
+            if let windows { return await windows.perform(action, language: language) }
+            return .failed(reason: actionText(language, "Керування вікнами не підключено.", "Window control is not connected."))
+        case .volumeSet, .volumeStep, .mute:
+            if let audioOutput { return await audioOutput.perform(action, language: language) }
+            return .failed(reason: actionText(language, "Керування звуком не підключено.", "Sound control is not connected."))
+        case .dictate(let text):
+            if let dictation { return await dictation.insert(text, token: dictationToken, language: language) }
+            return .failed(reason: actionText(language, "Диктування не підключено.", "Dictation is not connected."))
+        }
+    }
+    private func openWeb(_ url: URL, language: String) async throws -> CommandOutcome {
+        try Task.checkCancellation()
+        let accepted = try await workspace.openWebURL(url)
+        return accepted ? .done(summary: actionText(language, "Посилання передано браузеру.", "The link was handed to the browser.")) : .failed(reason: actionText(language, "Браузер не прийняв посилання.", "The browser did not accept the link."))
+    }
+}
