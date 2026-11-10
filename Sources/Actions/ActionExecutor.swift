@@ -15,13 +15,17 @@ actor ActionEvents {
 
 final class ActionExecutor: CommandHandling {
     private let workspace: ActionWorkspace
+    private let windows: WindowActions?
+    private let audioOutput: AudioOutputActions?
     private let parser = IntentParser()
     private let registry = ActionRegistry()
     let events = ActionEvents()
 
-    init(workspace: ActionWorkspace) { self.workspace = workspace }
+    init(workspace: ActionWorkspace, windows: WindowActions? = nil, audioOutput: AudioOutputActions? = nil) {
+        self.workspace = workspace; self.windows = windows; self.audioOutput = audioOutput
+    }
     @MainActor static func live(aliases: AppAliases = .defaults) -> ActionExecutor {
-        ActionExecutor(workspace: MacActionWorkspace(aliases: aliases))
+        ActionExecutor(workspace: MacActionWorkspace(aliases: aliases), windows: WindowActions(access: MacWindowAccess()), audioOutput: AudioOutputActions(access: MacOutputAccess()))
     }
 
     func handle(_ text: String, language: String) async -> CommandOutcome {
@@ -72,6 +76,12 @@ final class ActionExecutor: CommandHandling {
             return try await openWeb(WebActions.validatedURL(raw), language: language)
         case .webSearch(let query):
             return try await openWeb(WebActions.searchURL(query), language: language)
+        case .windowMinimize, .windowMaximize, .windowLeftHalf, .windowRightHalf:
+            if let windows { return await windows.perform(action, language: language) }
+            return .failed(reason: actionText(language, "Керування вікнами не підключено.", "Window control is not connected."))
+        case .volumeSet, .volumeStep, .mute:
+            if let audioOutput { return await audioOutput.perform(action, language: language) }
+            return .failed(reason: actionText(language, "Керування звуком не підключено.", "Sound control is not connected."))
         default:
             return .failed(reason: actionText(language, "Цю дію ще не підключено.", "This action is not connected yet."))
         }
