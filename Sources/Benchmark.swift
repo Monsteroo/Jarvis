@@ -4,7 +4,7 @@ import AVFoundation
 @main struct Benchmark {
  static func main() throws {
     guard CommandLine.arguments.count >= 3 else {
-        fputs("Usage: jarvis-benchmark MODEL WAV [language=auto] [runs=3]\nInput: mono 16kHz WAV, <=30s.\n", stderr); exit(2)
+        fputs("Usage: jarvis-benchmark MODEL WAV [language=uk] [runs=3]\nInput: mono 16kHz WAV, <=30s.\n", stderr); exit(2)
     }
     let args=CommandLine.arguments
     let file=try AVAudioFile(forReading: URL(fileURLWithPath:args[2]))
@@ -19,7 +19,7 @@ import AVFoundation
     guard let ctx=jv_create(args[1]) else { fputs("Cannot load model\n",stderr); exit(1) }
     defer { jv_free(ctx) }
     let loadMS=(ProcessInfo.processInfo.systemUptime-start)*1000
-    let language=args.count>3 ? args[3] : "auto"
+    let language=args.count>3 ? args[3] : "uk"
     let runs=args.count>4 ? min(50,max(1,Int(args[4]) ?? 3)) : 3
     for i in 0..<runs {
         var out=[CChar](repeating:0,count:16384)

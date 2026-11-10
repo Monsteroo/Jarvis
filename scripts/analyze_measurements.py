@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Summarise .runtime/measurements/measurements.jsonl per model + language setting.
+"""Summarise .runtime/measurements/uk-en-v1.jsonl per model + language setting.
 
 Accuracy counts every attempt: errors, empty results, timeouts and skips are failures,
 never dropped. Latency is reported separately for text responses and all completed attempts.
@@ -13,7 +13,7 @@ import unicodedata
 from collections import defaultdict
 from pathlib import Path
 
-DEFAULT = Path(__file__).resolve().parent.parent / ".runtime/measurements/measurements.jsonl"
+DEFAULT = Path(__file__).resolve().parent.parent / ".runtime/measurements/uk-en-v1.jsonl"
 
 
 def normalize(text: str) -> list[str]:

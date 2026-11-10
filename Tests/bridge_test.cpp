@@ -12,6 +12,8 @@ int main(int argc, char **argv) {
   if (argc > 1) {
     void *ctx=jv_create(argv[1]); assert(ctx);
     assert(jv_transcribe(ctx,audio,4000,"uk",out,16)==1);
+    assert(jv_transcribe(ctx,audio,4000,"ru",out,16)==-1);
+    assert(jv_transcribe(ctx,audio,4000,"auto",out,16)==-1);
     audio[0]=NAN;
     assert(jv_transcribe(ctx,audio,4000,"uk",out,16)==-1);
     audio[0]=0;

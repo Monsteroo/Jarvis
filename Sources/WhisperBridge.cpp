@@ -22,7 +22,7 @@ void jv_cancel(void *p) { if (p) static_cast<Engine*>(p)->cancelled.store(true);
 int jv_transcribe(void *p, const float *audio, int count, const char *language, char *out, int capacity) {
     if (out && capacity > 0) out[0] = 0;
     if (!p || !audio || !out || capacity < 1 || count < 1600 || count > 16000*30 || !language) return -1;
-    if (std::strcmp(language,"auto") && whisper_lang_id(language) < 0) return -1;
+    if (std::strcmp(language,"uk") && std::strcmp(language,"en")) return -1;
     double energy=0;
     for (int i=0;i<count;i++) { if (!std::isfinite(audio[i])) return -1; energy += double(audio[i])*audio[i]; }
     if (std::sqrt(energy/count) < 0.001) return 1; // Silence gate, not a speech classifier.

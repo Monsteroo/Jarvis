@@ -133,7 +133,7 @@ final class JarvisApp: NSObject, NSApplicationDelegate {
         Bundle.main.object(forInfoDictionaryKey: "JarvisProjectRoot") as? String ?? FileManager.default.currentDirectoryPath
     }
     private var modelName: String { model.indexOfSelectedItem == 1 ? "small" : "base" }
-    private var languageCode: String { ["uk", "ru", "en", "auto"][max(0, language.indexOfSelectedItem)] }
+    private var languageCode: String { ["uk", "en"][max(0, language.indexOfSelectedItem)] }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         makeWindow()
@@ -172,7 +172,7 @@ final class JarvisApp: NSObject, NSApplicationDelegate {
         status.font = .systemFont(ofSize: 14, weight: .medium)
         timing.font = .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
         timing.textColor = .secondaryLabelColor
-        language.addItems(withTitles: ["Українська", "Русский", "English", "Автовизначення"])
+        language.addItems(withTitles: ["Українська", "English"])
         language.toolTip = "Мова розпізнавання"
         language.setAccessibilityLabel("Мова розпізнавання")
         model.addItems(withTitles: ["base", "small"])
@@ -512,7 +512,7 @@ final class JarvisApp: NSObject, NSApplicationDelegate {
         if prompts.isEmpty {
             let path = projectRoot + "/docs/benchmarks/prompts.txt"
             prompts = PromptSet.parse((try? String(contentsOfFile: path, encoding: .utf8)) ?? "")
-            measurementLog = MeasurementLog(url: URL(fileURLWithPath: projectRoot + "/.runtime/measurements/measurements.jsonl"))
+            measurementLog = MeasurementLog(url: URL(fileURLWithPath: projectRoot + "/.runtime/measurements/uk-en-v1.jsonl"))
         }
         promptLabel.isHidden = false
         guard !prompts.isEmpty, let measurementLog else {
