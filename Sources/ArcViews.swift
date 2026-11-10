@@ -45,6 +45,10 @@ final class VoiceStore: ObservableObject {
     @Published var mainVisible = true
     @Published var hudVisible = false
     @Published var reduceMotion = false
+    /// Quiet cue when "Jarvis" is recognised; the user can turn it off.
+    @Published var acknowledgmentSound = UserDefaults.standard.object(forKey: "acknowledgmentSound") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(acknowledgmentSound, forKey: "acknowledgmentSound") }
+    }
     let modelTitles = ["Parakeet UK", "Whisper small", "Whisper base"]
     let languageTitles = ["Українська", "English"]
 
@@ -93,7 +97,7 @@ final class VoiceStore: ObservableObject {
             if !hotKeyAvailable { return "Не вдалося зареєструвати ⌃⌥Пробіл. Закрийте інший Jarvis або програму з цим скороченням." }
             return "Утримуйте ⌃⌥Пробіл, говоріть і відпустіть. Мікрофон працює лише під час утримання."
         case .wakeListening:
-            return "Скажіть «Jarvis» і команду — або утримуйте ⌃⌥Пробіл. Мікрофон слухає локально лише слово активації."
+            return "Скажіть «Jarvis» і команду — або утримуйте ⌃⌥Пробіл. Фрази розпізнаються локально; без «Jarvis» відкидаються одразу."
         case .recording:
             let esc = escapeUnavailable ? "кнопка «Скасувати»" : "Esc — скасувати"
             if !keyRecording {
@@ -129,6 +133,7 @@ struct VoiceActions {
     var revealDiagnostic: () -> Void = {}
     var setMeasuring: (Bool) -> Void = { _ in }
     var skipPrompt: () -> Void = {}
+    var openMicrophoneSettings: () -> Void = {}
 }
 
 // MARK: - Shared pieces
@@ -358,6 +363,10 @@ struct AssistantView: View {
                 .multilineTextAlignment(.center)
                 .frame(maxWidth: 640)
                 .padding(.top, 6)
+            if store.permissionDenied && !store.machine.microphoneEnabled {
+                Button("Відкрити налаштування мікрофона", action: actions.openMicrophoneSettings)
+                    .padding(.top, 8)
+            }
             Spacer(minLength: 14)
             StagesRow(store: store)
             HStack(spacing: 14) {
@@ -508,6 +517,10 @@ struct DiagnosticsView: View {
                         .disabled(store.machine.busy)
                     }
                     note("Ліміт запису: \(store.recordLimit) с. Parakeet UK — модель за замовчуванням; Whisper — резервні варіанти.")
+                }
+                section("Активація «Jarvis»") {
+                    Toggle("Тихий звук, коли Jarvis почув слово активації", isOn: $store.acknowledgmentSound)
+                    note("Звук синтезується на цьому Mac і не записується.")
                 }
                 section("Останній результат") {
                     HStack {

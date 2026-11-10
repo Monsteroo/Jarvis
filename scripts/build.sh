@@ -40,6 +40,8 @@ swiftc "${SWIFT_FLAGS[@]}" -swift-version 5 -Onone -parse-as-library Sources/Voi
 swiftc "${SWIFT_FLAGS[@]}" -swift-version 5 -Onone -parse-as-library Sources/Measurement.swift Tests/MeasurementTests.swift -o .build/measurement-tests
 .build/measurement-tests
 swiftc "${SWIFT_FLAGS[@]}" -swift-version 5 -Onone -parse-as-library Sources/Diagnostic.swift Tests/DiagnosticTests.swift -o .build/diagnostic-tests
+swiftc "${SWIFT_FLAGS[@]}" -swift-version 5 -Onone -parse-as-library Sources/Acknowledgment.swift Tests/AcknowledgmentTests.swift -o .build/acknowledgment-tests
+.build/acknowledgment-tests
 .build/diagnostic-tests
 swiftc "${SWIFT_FLAGS[@]}" -swift-version 5 -O -parse-as-library Sources/Parakeet.swift Tests/ParakeetTests.swift -o .build/parakeet-tests
 .build/parakeet-tests
@@ -75,7 +77,7 @@ fi
 if [[ -f Sources/App.swift ]]; then
 APP="$ROOT/dist/Jarvis Voice Lab.app"
 mkdir -p "$APP/Contents/MacOS"
-swiftc "${SWIFT_FLAGS[@]}" -swift-version 5 -O -parse-as-library -import-objc-header Sources/Bridging.h Sources/App.swift Sources/Audio.swift Sources/AudioMetrics.swift Sources/VoiceState.swift Sources/ArcRenderer.swift Sources/ArcViews.swift Sources/WakeSupport.swift Sources/WakeListener.swift Sources/Measurement.swift Sources/Diagnostic.swift Sources/Parakeet.swift .build/WhisperBridge.o .build/WakeBridge.o "${LIBS[@]}" "${WAKE_LIBS[@]}" "${FRAMEWORKS[@]}" -framework AppKit -framework SwiftUI -framework AVFoundation -framework Carbon -lc++ -o "$APP/Contents/MacOS/JarvisVoiceLab"
+swiftc "${SWIFT_FLAGS[@]}" -swift-version 5 -O -parse-as-library -import-objc-header Sources/Bridging.h Sources/App.swift Sources/Audio.swift Sources/AudioMetrics.swift Sources/VoiceState.swift Sources/ArcRenderer.swift Sources/ArcViews.swift Sources/WakeSupport.swift Sources/WakeListener.swift Sources/Measurement.swift Sources/Diagnostic.swift Sources/Acknowledgment.swift Sources/Parakeet.swift .build/WhisperBridge.o .build/WakeBridge.o "${LIBS[@]}" "${WAKE_LIBS[@]}" "${FRAMEWORKS[@]}" -framework AppKit -framework SwiftUI -framework AVFoundation -framework Carbon -lc++ -o "$APP/Contents/MacOS/JarvisVoiceLab"
 python3 - "$APP/Contents/Info.plist" "$ROOT" <<'PY'
 import plistlib,sys
 with open(sys.argv[1],'wb') as f:

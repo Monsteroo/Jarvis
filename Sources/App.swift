@@ -84,6 +84,25 @@ final class LocalSpeech {
         }
     }
 
+    /// Runs one throwaway Parakeet pass on a quiet synthetic tone so model
+    /// weights are paged in before the first real command (a cold first pass
+    /// measured 3.5–5.7 s). Silence would be skipped by the energy check, so
+    /// the signal must not be silent. Queued: a real command waits behind it.
+    func warmUp(completion: @escaping (Double) -> Void) {
+        queue.async {
+            self.lock.lock()
+            let parakeet = self.closing ? nil : self.parakeet
+            parakeet?.resetCancellation()
+            self.lock.unlock()
+            guard let parakeet else { return }
+            let tone = (0..<16_000).map { Float(0.05 * sin(Double($0) * 0.07)) }
+            let start = ProcessInfo.processInfo.systemUptime
+            _ = try? parakeet.transcribe(tone, language: "uk")
+            let elapsed = ProcessInfo.processInfo.systemUptime - start
+            DispatchQueue.main.async { completion(elapsed) }
+        }
+    }
+
     func cancel() {
         lock.lock()
         generation += 1
@@ -211,7 +230,10 @@ final class JarvisApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             toggleDiagnostic: { [weak self] in self?.toggleDiagnostic() },
             revealDiagnostic: { [weak self] in self?.revealDiagnostic() },
             setMeasuring: { [weak self] in self?.setMeasuring($0) },
-            skipPrompt: { [weak self] in self?.skipPrompt() })
+            skipPrompt: { [weak self] in self?.skipPrompt() },
+            openMicrophoneSettings: {
+                NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone")!)
+            })
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -266,6 +288,8 @@ final class JarvisApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                               "\(store.phase)", value.envelope, debugPeak, bands).data(using: .utf8)!)
         debugPeak = 0
     }
+
+    private let chime = AcknowledgmentSound()
 
     private func observe(_ center: NotificationCenter, _ name: Notification.Name, _ handler: @escaping (JarvisApp) -> Void) {
         let token = center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
@@ -460,6 +484,8 @@ final class JarvisApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             : projectRoot + "/.runtime/models/ggml-" + modelName + ".bin"
         speech.load(path: path) { [weak self] ready in
             self?.store.machine.modelLoaded(ready)
+            guard ready else { return }
+            self?.speech.warmUp { seconds in self?.wakeTrace(String(format: "asr warm-up %.2f s", seconds)) }
         }
     }
 
@@ -762,6 +788,7 @@ final class JarvisApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             source = .wake
             store.keyRecording = false
             beginTurnUI(id)
+            acknowledge()
         case .endpoint(let outcome):
             wakeTrace("endpoint \(outcome) source=\(source) phase=\(store.machine.phase)")
             guard source == .wake, store.machine.phase == .recording, turn != nil else { return }
@@ -824,6 +851,12 @@ final class JarvisApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                   responseSeconds: ProcessInfo.processInfo.systemUptime - segment.heardAt)
         store.machine.beginTranscribing(turn: id, timedOut: false)
         _ = store.machine.finishTranscription(turn: id, text: text)
+        acknowledge()
+    }
+
+    private func acknowledge() {
+        guard store.acknowledgmentSound else { return }
+        chime.play()
     }
 
     private func restartMonitoring(reason: Error) {
