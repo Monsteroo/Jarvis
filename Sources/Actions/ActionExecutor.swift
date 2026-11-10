@@ -17,18 +17,30 @@ final class ActionExecutor: CommandHandling {
     private let workspace: ActionWorkspace
     private let windows: WindowActions?
     private let audioOutput: AudioOutputActions?
+    private let dictation: DictationActions?
+    private let history: HistoryStore?
     private let parser = IntentParser()
     private let registry = ActionRegistry()
     let events = ActionEvents()
 
-    init(workspace: ActionWorkspace, windows: WindowActions? = nil, audioOutput: AudioOutputActions? = nil) {
+    init(workspace: ActionWorkspace, windows: WindowActions? = nil, audioOutput: AudioOutputActions? = nil, dictation: DictationActions? = nil, history: HistoryStore? = nil) {
         self.workspace = workspace; self.windows = windows; self.audioOutput = audioOutput
+        self.dictation = dictation; self.history = history
     }
-    @MainActor static func live(aliases: AppAliases = .defaults) -> ActionExecutor {
-        ActionExecutor(workspace: MacActionWorkspace(aliases: aliases), windows: WindowActions(access: MacWindowAccess()), audioOutput: AudioOutputActions(access: MacOutputAccess()))
+    @MainActor static func live(aliases: AppAliases = .defaults, history: HistoryStore? = nil) -> ActionExecutor {
+        ActionExecutor(workspace: MacActionWorkspace(aliases: aliases), windows: WindowActions(access: MacWindowAccess()), audioOutput: AudioOutputActions(access: MacOutputAccess()), dictation: DictationActions(access: MacDictationAccess()), history: history)
     }
 
+    @MainActor func captureDictationTarget() throws -> UUID {
+        guard let dictation else { throw DeviceActionError.unavailable }
+        return try dictation.capture()
+    }
+    @MainActor func invalidateDictationTarget() { dictation?.invalidate() }
+
     func handle(_ text: String, language: String) async -> CommandOutcome {
+        await handle(text, language: language, dictationToken: nil)
+    }
+    func handle(_ text: String, language: String, dictationToken: UUID?) async -> CommandOutcome {
         guard language == "uk" || language == "en" else {
             return .failed(reason: "Оберіть українську або англійську мову.")
         }
@@ -38,12 +50,25 @@ final class ActionExecutor: CommandHandling {
         catch { return .failed(reason: actionText(language, "Некоректні параметри команди.", "Invalid command parameters.")) }
         let turnID = UUID()
         await events.emit(ActionEvent(turnID: turnID, action: action, phase: .started))
-        let result: CommandOutcome
+        let started = ProcessInfo.processInfo.systemUptime
+        var result: CommandOutcome
         do {
             try Task.checkCancellation()
-            result = try await execute(action, language: language)
+            result = try await execute(action, language: language, dictationToken: dictationToken)
         } catch is CancellationError { result = cancelled(language) }
         catch { result = .failed(reason: actionText(language, "Не вдалося виконати дію. Перевірте програму й повторіть спробу.", "The action failed. Check the application and try again.")) }
+        if let history {
+            do { try await history.record(action: action, outcome: result, duration: ProcessInfo.processInfo.systemUptime - started) }
+            catch {
+                let warning = actionText(language, "Не вдалося зберегти історію.", "History could not be saved.")
+                switch result {
+                case .done(let summary): result = .partial(summary: summary, details: warning)
+                case .partial(let summary, let details): result = .partial(summary: summary, details: details + " " + warning)
+                case .failed(let reason): result = .failed(reason: reason + " " + warning)
+                default: break
+                }
+            }
+        }
         await events.emit(ActionEvent(turnID: turnID, action: action, phase: .finished(result)))
         return result
     }
@@ -51,7 +76,7 @@ final class ActionExecutor: CommandHandling {
     private func cancelled(_ language: String) -> CommandOutcome {
         .failed(reason: actionText(language, "Запит скасовано. Уже розпочата дія могла виконатися.", "Request cancelled. An action already started may have completed."))
     }
-    private func execute(_ action: Action, language: String) async throws -> CommandOutcome {
+    private func execute(_ action: Action, language: String, dictationToken: UUID?) async throws -> CommandOutcome {
         switch action {
         case .openApp(let name), .activateApp(let name), .quitApp(let name):
             guard let url = await workspace.resolveApplication(name) else {
@@ -82,8 +107,9 @@ final class ActionExecutor: CommandHandling {
         case .volumeSet, .volumeStep, .mute:
             if let audioOutput { return await audioOutput.perform(action, language: language) }
             return .failed(reason: actionText(language, "Керування звуком не підключено.", "Sound control is not connected."))
-        default:
-            return .failed(reason: actionText(language, "Цю дію ще не підключено.", "This action is not connected yet."))
+        case .dictate(let text):
+            if let dictation { return await dictation.insert(text, token: dictationToken, language: language) }
+            return .failed(reason: actionText(language, "Диктування не підключено.", "Dictation is not connected."))
         }
     }
     private func openWeb(_ url: URL, language: String) async throws -> CommandOutcome {
