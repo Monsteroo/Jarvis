@@ -26,6 +26,7 @@ struct CaptureGateTests {
         assert(!gate.press(enabled: true, authorized: true, ready: true), "Cancel while held must require release")
         assert(!gate.release(), "Cancelled audio must not be transcribed")
         assert(gate.press(enabled: true, authorized: true, ready: true), "Fresh press after cancellation works")
-        print("CaptureGateTests: 19 lifecycle assertions passed")
+        assert(AudioCapture().meterSnapshot() == nil, "An idle capture never feeds the visualizer")
+        print("CaptureGateTests: 20 lifecycle assertions passed")
     }
 }

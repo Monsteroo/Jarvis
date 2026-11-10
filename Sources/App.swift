@@ -1,6 +1,8 @@
 import AppKit
 import AVFoundation
 import Carbon
+import Combine
+import SwiftUI
 
 /// All inference and destruction run on one queue; cancellation is the only
 /// concurrent bridge call and uses the bridge's atomic cancellation flag.
@@ -10,12 +12,16 @@ final class LocalSpeech {
     private var context: UnsafeMutableRawPointer?
     private var parakeet: ParakeetASR?
     private var generation = 0
+    /// Separate from `generation`: cancelling an utterance must never drop a
+    /// pending model-load completion, or the UI would stay in "loading" forever.
+    private var loadGeneration = 0
     private var closing = false
 
     func load(path: String, completion: @escaping (Bool) -> Void) {
         cancel()
         lock.lock()
-        let ticket = generation
+        loadGeneration += 1
+        let ticket = loadGeneration
         lock.unlock()
         queue.async {
             self.lock.lock()
@@ -33,7 +39,7 @@ final class LocalSpeech {
             self.lock.unlock()
             DispatchQueue.main.async {
                 self.lock.lock()
-                let valid = ticket == self.generation
+                let valid = ticket == self.loadGeneration && !self.closing
                 self.lock.unlock()
                 if !closing && valid { completion(context != nil || parakeet != nil) }
             }
@@ -103,31 +109,47 @@ final class LocalSpeech {
     }
 }
 
+
 private let hotKeySignature: OSType = 0x4A525653 // JRVS
 
-final class JarvisApp: NSObject, NSApplicationDelegate {
+/// Floating HUD that never becomes key, so dictation targets keep focus.
+final class HUDPanel: NSPanel {
+    override var canBecomeKey: Bool { false }
+    override var canBecomeMain: Bool { false }
+}
+
+/// Mic-off and cancel must react to the first click, even in an inactive window or the non-key HUD.
+final class FirstMouseHostingView<Content: View>: NSHostingView<Content> {
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+}
+
+final class JarvisApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
+    private let store = VoiceStore()
+    private let level = LevelStore()
+    private lazy var meter = AudioMeterPump { [weak self] in
+        self?.level.value = $0
+        self?.debugLevel($0)
+    }
+    /// Opt-in developer check (JARVIS_DEBUG_LEVELS=1): prints envelope numbers
+    /// twice a second to stderr. Numbers only — never audio samples.
+    private let debugLevels = ProcessInfo.processInfo.environment["JARVIS_DEBUG_LEVELS"] == "1"
+    private var debugPeak: Float = 0
+    private var debugStamp = 0.0
     private var window: NSWindow!
-    private let status = NSTextField(wrappingLabelWithString: "Завантаження локальної моделі…")
-    private let timing = NSTextField(labelWithString: "Звук залишається в оперативній пам’яті цього Mac.")
-    private let transcript = NSTextView()
-    private let enableButton = NSButton(title: "Увімкнути мікрофон", target: nil, action: nil)
-    private let cancelButton = NSButton(title: "Скасувати", target: nil, action: nil)
+    private var hud: HUDPanel!
+    private var statusItem: NSStatusItem?
+    private var hudHide: Timer?
+    private var stateSink: AnyCancellable?
     private let diagnostic = DiagnosticCapture()
-    private let diagnosticButton = NSButton(title: "Зберегти наступну фразу у WAV", target: nil, action: nil)
-    private let revealButton = NSButton(title: "Показати WAV", target: nil, action: nil)
-    private let diagnosticLabel = NSTextField(wrappingLabelWithString: "Збереження аудіо вимкнено.")
-    private var diagnosticURL: URL?
-    private let copyButton = NSButton(title: "Копіювати текст", target: nil, action: nil)
-    private let language = NSPopUpButton(frame: .zero, pullsDown: false)
-    private let model = NSPopUpButton(frame: .zero, pullsDown: false)
-    private var modelLoading = true
     private let audio = AudioCapture()
     private let speech = LocalSpeech()
+    private lazy var wake = WakeListener { [weak self] in self?.wakeEvent($0) }
+    private enum RecordSource { case ptt, wake }
+    private var source: RecordSource = .ptt
+    /// Wake monitoring was running before sleep / session switch.
+    private var resumeWakeOnWake = false
     private var gate = CaptureGate()
-    private var enabled = false
-    private var modelReady = false
-    private var processing = false
-    private var permissionPending = false
+    private var turn: Int?
     private var hotKey: EventHotKeyRef?
     private var escapeKey: EventHotKeyRef?
     private var escapeChord: EventHotKeyRef?
@@ -135,149 +157,283 @@ final class JarvisApp: NSObject, NSApplicationDelegate {
     private var timeout: Timer?
     private var clock: Timer?
     private var started = 0.0
-    private var observers: [NSObjectProtocol] = []
-    private var hotKeyAvailable = false
-    private let measureToggle = NSButton(checkboxWithTitle: "Режим вимірювань", target: nil, action: nil)
-    private let skipButton = NSButton(title: "Пропустити фразу", target: nil, action: nil)
-    private let promptLabel = NSTextField(wrappingLabelWithString: "")
+    private var observers: [(NotificationCenter, NSObjectProtocol)] = []
     private var prompts: [Prompt] = []
     private var measurementLog: MeasurementLog?
     private var progress: MeasurementProgress?
-    private var measuring: Bool { measureToggle.state == .on }
 
     private var projectRoot: String {
         Bundle.main.object(forInfoDictionaryKey: "JarvisProjectRoot") as? String ?? FileManager.default.currentDirectoryPath
     }
     private let modelNames = ["parakeet-uk-v3", "small", "base"]
-    private var modelName: String { modelNames[max(0,model.indexOfSelectedItem)] }
+    private var modelName: String { modelNames[store.modelIndex] }
     private var recordingLimit: Int { modelName == "parakeet-uk-v3" ? 15 : 30 }
-    private var languageCode: String { ["uk", "en"][max(0, language.indexOfSelectedItem)] }
+    private var languageCode: String { ["uk", "en"][store.languageIndex] }
+
+    private var actions: VoiceActions {
+        VoiceActions(
+            toggleMicrophone: { [weak self] in self?.toggleMicrophone() },
+            toggleWake: { [weak self] in self?.toggleWake() },
+            cancel: { [weak self] in self?.cancelSession(message: "Скасовано. Запис зупинено, результат відкинуто.") },
+            copy: { [weak self] in self?.copyTranscript() },
+            setLanguage: { [weak self] in self?.setLanguage($0) },
+            setModel: { [weak self] in self?.setModel($0) },
+            toggleDiagnostic: { [weak self] in self?.toggleDiagnostic() },
+            revealDiagnostic: { [weak self] in self?.revealDiagnostic() },
+            setMeasuring: { [weak self] in self?.setMeasuring($0) },
+            skipPrompt: { [weak self] in self?.skipPrompt() })
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        store.reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        store.recordLimit = recordingLimit
+        makeMainMenu()
         makeWindow()
+        makeHUD()
+        makeStatusItem()
         registerHotKey()
         audio.onLimit = { [weak self] in self?.finishRecording(timedOut: true) }
         audio.onFailure = { [weak self] error in
-            guard let self, self.gate.recording else { return }
-            self.cancelSession(message: error.localizedDescription)
+            guard let self else { return }
+            let wasBusy = self.store.machine.phase == .recording
+            self.cancelSession(message: "")
+            if wasBusy { self.store.machine.fail(message: error.localizedDescription) }
+            // Wake monitoring survives an input-device switch: restart it on
+            // the new device, or turn activation off with a visible reason.
+            if self.store.machine.wakeEnabled { self.restartMonitoring(reason: error) }
         }
         let workspace = NSWorkspace.shared.notificationCenter
-        observers.append(workspace.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { [weak self] _ in
-            self?.cancelSession(message: "Запис скасовано перед сном Mac.")
-        })
-        observers.append(workspace.addObserver(forName: NSWorkspace.sessionDidResignActiveNotification, object: nil, queue: .main) { [weak self] _ in
-            self?.cancelSession(message: "Запис скасовано: сеанс Mac неактивний.")
-        })
+        observe(workspace, NSWorkspace.willSleepNotification) { $0.suspendCapture(message: "Запис скасовано перед сном Mac.") }
+        observe(workspace, NSWorkspace.sessionDidResignActiveNotification) { $0.suspendCapture(message: "Запис скасовано: сеанс Mac неактивний.") }
         for name in [NSWorkspace.didWakeNotification, NSWorkspace.sessionDidBecomeActiveNotification] {
-            observers.append(workspace.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
-                // A release can be lost while the session sleeps or switches users.
-                _ = self?.gate.release()
-            })
+            // A release can be lost while the session sleeps or switches users.
+            observe(workspace, name) { app in
+                _ = app.gate.release()
+                app.resumeCapture()
+            }
+        }
+        observe(workspace, NSWorkspace.accessibilityDisplayOptionsDidChangeNotification) {
+            $0.store.reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        }
+        observe(NotificationCenter.default, NSWindow.didChangeOcclusionStateNotification) { app in
+            app.store.mainVisible = app.window.isVisible && app.window.occlusionState.contains(.visible)
+        }
+        stateSink = store.$machine.removeDuplicates().sink { [weak self] machine in
+            DispatchQueue.main.async { self?.stateChanged(machine) }
         }
         loadSelectedModel()
         NSApp.activate(ignoringOtherApps: true)
     }
 
+    private func debugLevel(_ value: AudioLevel) {
+        guard debugLevels else { return }
+        debugPeak = max(debugPeak, value.envelope)
+        let now = ProcessInfo.processInfo.systemUptime
+        guard now - debugStamp >= 0.5 else { return }
+        debugStamp = now
+        let bands = value.bands.map { String(format: "%.2f", $0) }.joined(separator: " ")
+        FileHandle.standardError.write(String(format: "level phase=%@ env=%.3f max=%.3f bands=[%@]\n",
+                                              "\(store.phase)", value.envelope, debugPeak, bands).data(using: .utf8)!)
+        debugPeak = 0
+    }
+
+    private func observe(_ center: NotificationCenter, _ name: Notification.Name, _ handler: @escaping (JarvisApp) -> Void) {
+        let token = center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+            if let self { handler(self) }
+        }
+        observers.append((center, token))
+    }
+
+    // MARK: Surfaces
+
+    private func makeMainMenu() {
+        let main = NSMenu()
+        let appItem = NSMenuItem()
+        let appMenu = NSMenu()
+        appMenu.addItem(withTitle: "Сховати Jarvis", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
+        appMenu.addItem(.separator())
+        appMenu.addItem(withTitle: "Завершити Jarvis", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        appItem.submenu = appMenu
+        main.addItem(appItem)
+        let editItem = NSMenuItem()
+        let editMenu = NSMenu(title: "Редагування")
+        editMenu.addItem(withTitle: "Копіювати", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        editMenu.addItem(withTitle: "Виділити все", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        editItem.submenu = editMenu
+        main.addItem(editItem)
+        let windowItem = NSMenuItem()
+        let windowMenu = NSMenu(title: "Вікно")
+        windowMenu.addItem(withTitle: "Закрити", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
+        windowMenu.addItem(withTitle: "Згорнути", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m")
+        windowItem.submenu = windowMenu
+        main.addItem(windowItem)
+        NSApp.mainMenu = main
+        NSApp.windowsMenu = windowMenu
+    }
+
     private func makeWindow() {
-        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 800, height: 650),
-                          styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
-        window.title = "Jarvis — локальний голос"
-        window.minSize = NSSize(width: 760, height: 610)
+        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1180, height: 760),
+                          styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
+                          backing: .buffered, defer: false)
+        window.title = "Jarvis"
+        window.titleVisibility = .hidden
+        window.titlebarAppearsTransparent = true
+        window.appearance = NSAppearance(named: .darkAqua)
+        window.backgroundColor = NSColor(red: 0.020, green: 0.039, blue: 0.063, alpha: 1)
+        window.isReleasedWhenClosed = false
+        window.minSize = NSSize(width: 1000, height: 680)
+        window.contentView = FirstMouseHostingView(rootView: MainView(store: store, level: level, actions: actions))
         window.center()
-        let heading = NSTextField(labelWithString: "Jarvis")
-        heading.font = .systemFont(ofSize: 30, weight: .semibold)
-        let hint = NSTextField(wrappingLabelWithString: "Утримуйте ⌃⌥Пробіл, говоріть і відпустіть для розпізнавання. Esc — скасувати. Максимум 15 с для Parakeet, 30 с для Whisper.")
-        status.font = .systemFont(ofSize: 14, weight: .medium)
-        timing.font = .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
-        timing.textColor = .secondaryLabelColor
-        language.addItems(withTitles: ["Українська", "English"])
-        language.toolTip = "Мова розпізнавання"
-        language.setAccessibilityLabel("Мова розпізнавання")
-        model.addItems(withTitles: ["Parakeet UK", "Whisper small", "Whisper base"])
-        model.target = self
-        model.action = #selector(loadSelectedModel)
-        model.setAccessibilityLabel("Локальна модель")
-        enableButton.target = self
-        enableButton.action = #selector(toggleMicrophone)
-        copyButton.target = self
-        copyButton.action = #selector(copyTranscript)
-        copyButton.isEnabled = false
-        cancelButton.target = self
-        cancelButton.action = #selector(cancelFromButton)
-        cancelButton.isEnabled = false
-        language.target = self
-        language.action = #selector(refreshMeasurement)
-        measureToggle.target = self
-        measureToggle.action = #selector(refreshMeasurement)
-        measureToggle.toolTip = "Показує фрази з docs/benchmarks/prompts.txt і записує текст та час у .runtime/measurements. Аудіо не зберігається."
-        skipButton.target = self
-        skipButton.action = #selector(skipPrompt)
-        skipButton.isHidden = true
-        promptLabel.font = .systemFont(ofSize: 20, weight: .semibold)
-        promptLabel.isHidden = true
-        let controls = NSStackView(views: [enableButton, language, copyButton])
-        controls.orientation = .horizontal
-        controls.spacing = 12
-        transcript.isEditable = false
-        transcript.isSelectable = true
-        transcript.isRichText = false
-        transcript.font = .systemFont(ofSize: 18)
-        transcript.textContainerInset = NSSize(width: 14, height: 14)
-        transcript.autoresizingMask = [.width]
-        transcript.isVerticallyResizable = true
-        transcript.isHorizontallyResizable = false
-        transcript.textContainer?.widthTracksTextView = true
-        let scroll = NSScrollView()
-        scroll.hasVerticalScroller = true
-        scroll.borderType = .bezelBorder
-        scroll.documentView = transcript
-        let settings = NSStackView(views: [NSTextField(labelWithString: "Модель:"), model, cancelButton, measureToggle, skipButton])
-        settings.spacing = 10
-        diagnosticButton.target = self
-        diagnosticButton.action = #selector(toggleDiagnostic)
-        revealButton.target = self
-        revealButton.action = #selector(revealDiagnostic)
-        revealButton.isEnabled = false
-        diagnosticLabel.font = .systemFont(ofSize: 12)
-        let diagnosticControls = NSStackView(views: [diagnosticButton, revealButton])
-        diagnosticControls.spacing = 12
-        let stack = NSStackView(views: [heading, hint, controls, settings, diagnosticControls, diagnosticLabel, promptLabel, status, scroll, timing])
-        stack.orientation = .vertical
-        stack.alignment = .leading
-        stack.spacing = 18
-        stack.translatesAutoresizingMaskIntoConstraints = false
-        window.contentView!.addSubview(stack)
-        NSLayoutConstraint.activate([
-            stack.leadingAnchor.constraint(equalTo: window.contentView!.leadingAnchor, constant: 28),
-            stack.trailingAnchor.constraint(equalTo: window.contentView!.trailingAnchor, constant: -28),
-            stack.topAnchor.constraint(equalTo: window.contentView!.topAnchor, constant: 24),
-            stack.bottomAnchor.constraint(equalTo: window.contentView!.bottomAnchor, constant: -24),
-            scroll.widthAnchor.constraint(equalTo: stack.widthAnchor),
-            scroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 150),
-            hint.widthAnchor.constraint(equalTo: stack.widthAnchor),
-            status.widthAnchor.constraint(equalTo: stack.widthAnchor),
-            promptLabel.widthAnchor.constraint(equalTo: stack.widthAnchor)
-        ])
+        window.setFrameAutosaveName("JarvisMain")
         window.makeKeyAndOrderFront(nil)
     }
 
-    @objc private func loadSelectedModel() {
-        modelReady = false
-        modelLoading = true
-        model.isEnabled = false
-        status.stringValue = "Завантаження локальної моделі…"
+    private func makeHUD() {
+        hud = HUDPanel(contentRect: NSRect(x: 0, y: 0, width: 520, height: 64),
+                       styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: true)
+        hud.isFloatingPanel = true
+        hud.level = .statusBar
+        hud.hidesOnDeactivate = false
+        hud.becomesKeyOnlyIfNeeded = true
+        hud.isOpaque = false
+        hud.backgroundColor = .clear
+        hud.hasShadow = true
+        hud.isMovableByWindowBackground = true
+        hud.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
+        hud.title = "Jarvis HUD"
+        hud.contentView = FirstMouseHostingView(rootView: HUDView(store: store, level: level, actions: actions))
+    }
+
+    private func showHUD() {
+        hudHide?.invalidate()
+        hudHide = nil
+        guard !hud.isVisible else { return }
+        if let screen = NSScreen.main {
+            let f = screen.visibleFrame
+            hud.setFrameOrigin(NSPoint(x: f.midX - 260, y: f.minY + 36))
+        }
+        store.hudVisible = true
+        hud.orderFrontRegardless() // never makeKey: the target field keeps focus
+    }
+
+    private func hideHUD(after seconds: Double) {
+        hudHide?.invalidate()
+        guard hud.isVisible else { return }
+        hudHide = Timer.scheduledTimer(withTimeInterval: seconds, repeats: false) { [weak self] _ in
+            guard let self, !self.store.machine.busy else { return }
+            self.hud.orderOut(nil)
+            self.store.hudVisible = false
+            self.hudHide = nil
+        }
+    }
+
+    private func makeStatusItem() {
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        let menu = NSMenu()
+        menu.delegate = self
+        item.menu = menu
+        statusItem = item
+        updateStatusIcon()
+    }
+
+    private func updateStatusIcon() {
+        let symbol: String
+        switch store.phase {
+        case .microphoneOff: symbol = "mic.slash"
+        case .wakeListening: symbol = "ear"
+        case .recording: symbol = "waveform.circle.fill"
+        case .transcribing: symbol = "ellipsis.circle"
+        case .error, .modelUnavailable: symbol = "exclamationmark.triangle"
+        default: symbol = "waveform"
+        }
+        let image = NSImage(systemSymbolName: symbol, accessibilityDescription: "Jarvis: \(store.headline)")
+        image?.isTemplate = true
+        statusItem?.button?.image = image
+        statusItem?.button?.toolTip = "Jarvis — \(store.headline)"
+    }
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        menu.removeAllItems()
+        let state = NSMenuItem(title: "Стан: \(store.headline)", action: nil, keyEquivalent: "")
+        state.isEnabled = false
+        menu.addItem(state)
+        let wakeItem = menuItem("Активація словом «Jarvis»", #selector(toggleWakeFromMenu))
+        wakeItem.state = store.machine.wakeEnabled ? .on : .off
+        wakeItem.isEnabled = !store.wakeLoading && !store.permissionPending
+        menu.addItem(wakeItem)
+        menu.addItem(.separator())
+        menu.addItem(menuItem("Показати Jarvis", #selector(showMainWindow)))
+        menu.addItem(menuItem(store.machine.microphoneEnabled ? "Вимкнути мікрофон" : "Увімкнути мікрофон", #selector(toggleMicrophoneFromMenu)))
+        let cancel = menuItem("Скасувати поточний запит", #selector(cancelFromMenu))
+        cancel.isEnabled = store.machine.busy
+        menu.addItem(cancel)
+        menu.addItem(.separator())
+        menu.addItem(menuItem("Завершити Jarvis", #selector(quit)))
+    }
+
+    private func menuItem(_ title: String, _ action: Selector) -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
+        item.target = self
+        return item
+    }
+
+    @objc private func showMainWindow() {
+        NSApp.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
+    }
+    @objc private func toggleMicrophoneFromMenu() { toggleMicrophone() }
+    @objc private func toggleWakeFromMenu() { toggleWake() }
+    @objc private func cancelFromMenu() { cancelSession(message: "Скасовано. Запис зупинено, результат відкинуто.") }
+    @objc private func quit() { NSApp.terminate(nil) }
+
+    private func stateChanged(_ machine: VoiceMachine) {
+        updateStatusIcon()
+        // The detector listens only while idle with activation enabled; a
+        // wake-started command switches it to endpointing by itself.
+        if machine.wakeArmed && audio.isMonitoring {
+            wake.setMode(.armed)
+        } else if !(machine.busy && source == .wake) {
+            wake.setMode(.off)
+        }
+        switch machine.phase {
+        case .recording, .transcribing: showHUD()
+        case .microphoneOff: hideHUD(after: 1.2)
+        default: hideHUD(after: 3.5)
+        }
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if !flag { window.makeKeyAndOrderFront(nil) }
+        return true
+    }
+
+    // MARK: Model
+
+    private func setModel(_ index: Int) {
+        guard !store.machine.busy, index != store.modelIndex, store.modelTitles.indices.contains(index) else { return }
+        store.modelIndex = index
+        loadSelectedModel()
+    }
+
+    private func setLanguage(_ index: Int) {
+        guard !store.machine.busy, store.languageTitles.indices.contains(index) else { return }
+        store.languageIndex = index
+        refreshMeasurement()
+    }
+
+    private func loadSelectedModel() {
+        store.machine.modelLoading()
+        store.recordLimit = recordingLimit
         refreshMeasurement()
         let path = modelName == "parakeet-uk-v3"
             ? projectRoot + "/.runtime/parakeet-probe/model/parakeet-tdt-0.6b-v3"
             : projectRoot + "/.runtime/models/ggml-" + modelName + ".bin"
         speech.load(path: path) { [weak self] ready in
-            guard let self else { return }
-            self.modelLoading = false
-            self.modelReady = ready
-            self.model.isEnabled = true
-            self.updateIdleStatus()
+            self?.store.machine.modelLoaded(ready)
         }
     }
+
+    // MARK: Hotkeys
 
     private func registerHotKey() {
         var events = [
@@ -293,11 +449,11 @@ final class JarvisApp: NSObject, NSApplicationDelegate {
             let app = Unmanaged<JarvisApp>.fromOpaque(userData).takeUnretainedValue()
             let pressed = GetEventKind(event) == UInt32(kEventHotKeyPressed)
             if identifier.id == 1 { pressed ? app.keyDown() : app.keyUp() }
-            if (identifier.id == 2 || identifier.id == 3) && pressed { app.cancelSession(message: "Скасовано. Мікрофон вимкнено.") }
+            if (identifier.id == 2 || identifier.id == 3) && pressed { app.cancelSession(message: "Скасовано. Запис зупинено, результат відкинуто.") }
             return noErr
         }, events.count, &events, Unmanaged.passUnretained(self).toOpaque(), &eventHandler)
-        guard handlerStatus == noErr else { return }
-        hotKeyAvailable = RegisterEventHotKey(UInt32(kVK_Space), UInt32(controlKey | optionKey),
+        guard handlerStatus == noErr else { store.hotKeyAvailable = false; return }
+        store.hotKeyAvailable = RegisterEventHotKey(UInt32(kVK_Space), UInt32(controlKey | optionKey),
             EventHotKeyID(signature: hotKeySignature, id: 1), GetApplicationEventTarget(), 0, &hotKey) == noErr
     }
 
@@ -307,9 +463,7 @@ final class JarvisApp: NSObject, NSApplicationDelegate {
                             GetApplicationEventTarget(), 0, &escapeKey)
         let chordResult = RegisterEventHotKey(UInt32(kVK_Escape), UInt32(controlKey | optionKey),
             EventHotKeyID(signature: hotKeySignature, id: 3), GetApplicationEventTarget(), 0, &escapeChord)
-        if result != noErr || chordResult != noErr {
-            status.stringValue += " Esc недоступний — використайте кнопку «Скасувати»."
-        }
+        store.escapeUnavailable = result != noErr && chordResult != noErr
     }
 
     private func disableEscape() {
@@ -319,76 +473,71 @@ final class JarvisApp: NSObject, NSApplicationDelegate {
         escapeChord = nil
     }
 
-    @objc private func toggleMicrophone() {
-        if enabled {
-            enabled = false
-            enableButton.title = "Увімкнути мікрофон"
-            cancelSession(message: "Мікрофон вимкнено.")
+    // MARK: Microphone
+
+    private func toggleMicrophone() {
+        if store.machine.microphoneEnabled {
+            cancelSession(message: "")
+            // Full mic-off: wake monitoring stops too and the engine closes.
+            wake.stop()
+            audio.shutdown()
+            resumeWakeOnWake = false
+            store.machine.setMicrophone(enabled: false)
             return
         }
-        guard !permissionPending else { return }
+        guard !store.permissionPending else { return }
         switch AVCaptureDevice.authorizationStatus(for: .audio) {
         case .authorized:
-            enabled = true
-            enableButton.title = "Вимкнути мікрофон"
-            updateIdleStatus()
+            store.permissionDenied = false
+            store.machine.setMicrophone(enabled: true)
         case .notDetermined:
-            permissionPending = true
-            enableButton.isEnabled = false
+            store.permissionPending = true
             AVCaptureDevice.requestAccess(for: .audio) { [weak self] granted in
                 DispatchQueue.main.async {
                     guard let self else { return }
-                    self.permissionPending = false
-                    self.enableButton.isEnabled = true
-                    self.enabled = granted
-                    self.enableButton.title = granted ? "Вимкнути мікрофон" : "Увімкнути мікрофон"
-                    self.updateIdleStatus()
+                    self.store.permissionPending = false
+                    self.store.permissionDenied = !granted
+                    self.store.machine.setMicrophone(enabled: granted)
                     // Deliberately never call keyDown here, even if the key is held.
+                    if granted && self.store.pendingWake { self.continueEnablingWake() }
+                    if !granted { self.store.pendingWake = false }
                 }
             }
         default:
-            status.stringValue = "Дозвольте мікрофон для Jarvis у Системних параметрах → Конфіденційність і безпека → Мікрофон."
-        }
-    }
-
-    private func updateIdleStatus() {
-        guard !gate.recording && !processing else { return }
-        if !hotKeyAvailable {
-            status.stringValue = "Не вдалося зареєструвати ⌃⌥Пробіл. Закрийте інший Jarvis або програму з цим скороченням."
-        } else if modelLoading {
-            status.stringValue = "Завантаження локальної моделі…"
-        } else if !modelReady {
-            status.stringValue = "Локальна модель недоступна. Перевірте встановлення або виберіть іншу модель."
-        } else if enabled {
-            status.stringValue = "Готово. Мікрофон увімкнеться лише під час утримання ⌃⌥Пробіл."
-        } else if AVCaptureDevice.authorizationStatus(for: .audio) == .denied {
-            status.stringValue = "Доступ до мікрофона заборонено. Надайте його в Системних параметрах."
-        } else {
-            status.stringValue = "Модель готова. Натисніть «Увімкнути мікрофон», щоб дозволити голосове введення."
+            store.permissionDenied = true
+            store.pendingWake = false
+            store.machine.setMicrophone(enabled: false)
         }
     }
 
     private func keyDown() {
         let authorized = AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
-        guard gate.press(enabled: enabled, authorized: authorized, ready: modelReady && !processing && hotKeyAvailable) else { return }
+        guard gate.press(enabled: store.machine.microphoneEnabled, authorized: authorized,
+                         ready: store.machine.canRecord && store.hotKeyAvailable) else { return }
+        wake.setMode(.off) // PTT takes over; the detector must not fire mid-command
+        guard let id = store.machine.beginRecording() else { gate.cancel(); return }
         do { try audio.start(maximumSeconds: recordingLimit) } catch {
-            cancelSession(message: error.localizedDescription)
+            cancelSession(message: "")
+            store.machine.fail(message: error.localizedDescription)
             return
         }
-        cancelButton.isEnabled = true
-        diagnosticButton.isEnabled = false
+        source = .ptt
+        store.keyRecording = true
+        beginTurnUI(id)
+    }
+
+    /// Shared by PTT and wake-started turns once audio is being recorded.
+    private func beginTurnUI(_ id: Int) {
+        turn = id
         started = ProcessInfo.processInfo.systemUptime
-        language.isEnabled = false
-        model.isEnabled = false
-        measureToggle.isEnabled = false
-        skipButton.isEnabled = false
-        status.stringValue = "● Слухаю… Відпустіть ⌃⌥Пробіл для розпізнавання."
-        timing.stringValue = "Запис: 0,0 с / \(recordingLimit) с"
+        store.recordElapsed = 0
+        store.stages = TurnStages(record: .active)
+        let capture = audio
+        meter.start { capture.meterSnapshot() }
         enableEscape()
         clock = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
             guard let self else { return }
-            let elapsed = ProcessInfo.processInfo.systemUptime - self.started
-            self.timing.stringValue = String(format: "Запис: %.1f с / %d с", elapsed, self.recordingLimit)
+            self.store.recordElapsed = ProcessInfo.processInfo.systemUptime - self.started
         }
         timeout = Timer.scheduledTimer(withTimeInterval: Double(recordingLimit), repeats: false) { [weak self] _ in
             self?.finishRecording(timedOut: true)
@@ -403,58 +552,61 @@ final class JarvisApp: NSObject, NSApplicationDelegate {
     }
 
     private func finishRecording(timedOut: Bool) {
-        guard clock != nil else { return }
+        guard clock != nil, let id = turn else { return }
         let releasedAt = ProcessInfo.processInfo.systemUptime
         gate.cancel()
         stopTimers()
-        let samples = audio.stop()
+        meter.stop()
+        wake.setMode(.off)
+        let recorded = audio.stop()
+        // Wake commands end on silence; drop most of it so ASR does not invent
+        // words. PTT audio is kept exactly as recorded (measurement baseline).
+        let samples = source == .wake ? SpeechEndpoint.trimTrailingSilence(recorded) : recorded
         let duration = Double(samples.count) / 16_000
         let wasDiagnostic = diagnostic.armed
         if wasDiagnostic {
-            diagnosticButton.title = "Зберегти наступну фразу у WAV"
+            store.diagnosticArmed = false
             if duration < 0.25 || timedOut {
                 diagnostic.cancel()
-                diagnosticLabel.stringValue = "Діагностичний запис скасовано: надто короткий або досягнуто ліміту."
+                store.diagnosticLabel = "Діагностичний запис скасовано: надто короткий або досягнуто ліміту."
             } else {
                 do {
-                    diagnosticURL = try diagnostic.finish(samples: samples,
+                    store.diagnosticURL = try diagnostic.finish(samples: samples,
                         directory: URL(fileURLWithPath: projectRoot + "/.runtime/diagnostics"))
-                    revealButton.isEnabled = diagnosticURL != nil
-                    diagnosticLabel.stringValue = "WAV збережено локально. Збереження наступних фраз вимкнено."
+                    store.diagnosticLabel = "WAV збережено локально. Збереження наступних фраз вимкнено."
                 } catch {
-                    diagnosticLabel.stringValue = "Не вдалося зберегти WAV: " + error.localizedDescription
+                    store.diagnosticLabel = "Не вдалося зберегти WAV: " + error.localizedDescription
                 }
             }
         }
         guard duration >= 0.25 else {
-            restoreControls()
-            cancelButton.isEnabled = false
             disableEscape()
-            status.stringValue = "Запис надто короткий. Утримуйте ⌃⌥Пробіл і скажіть фразу."
+            turn = nil
+            store.stages = TurnStages()
+            store.machine.abandon(turn: id, message: source == .wake
+                ? "Не почув команди після «Jarvis». Скажіть ще раз."
+                : "Запис надто короткий. Утримуйте ⌃⌥Пробіл і скажіть фразу.")
             return
         }
-        processing = true
+        store.machine.beginTranscribing(turn: id, timedOut: timedOut)
+        store.stages.record = .done
+        store.stages.audioSeconds = duration
+        store.stages.recognize = .active
         let code = languageCode
-        let measured = measuring && !wasDiagnostic ? currentPrompt() : nil
+        let measured = store.measuring && !wasDiagnostic ? currentPrompt() : nil
         let measuredModel = modelName
-        status.stringValue = timedOut ? "Досягнуто ліміту запису. Мікрофон вимкнено, розпізнаю…" : "Мікрофон вимкнено. Розпізнаю локально…"
-        timing.stringValue = String(format: "Аудіо: %.1f с · розпізнавання…", duration)
         speech.transcribe(samples, language: code) { [weak self] text, elapsed in
             guard let self else { return }
+            // Stale results of cancelled turns are dropped by both LocalSpeech
+            // generations and the turn id.
+            guard self.store.machine.finishTranscription(turn: id, text: text) else { return }
             let responseTime = ProcessInfo.processInfo.systemUptime - releasedAt
-            self.processing = false
-            self.cancelButton.isEnabled = false
-            self.restoreControls()
+            self.turn = nil
             self.disableEscape()
-            if let text {
-                self.transcript.string = text
-                self.copyButton.isEnabled = !text.isEmpty
-                self.status.stringValue = text.isEmpty ? "Мовлення не знайдено. Спробуйте ще раз." : "Готово. Утримуйте ⌃⌥Пробіл для наступної фрази."
-            } else {
-                self.status.stringValue = "Помилка локального розпізнавання. Спробуйте ще раз."
-            }
-            self.timing.stringValue = String(format: "Аудіо: %.1f с · ASR: %.2f с · відповідь: %.2f с", duration, elapsed, responseTime)
-            self.timing.toolTip = "Відповідь — час від відпускання клавіші (або ліміту запису) до появи тексту."
+            self.store.stages.asrSeconds = elapsed
+            self.store.stages.responseSeconds = responseTime
+            self.store.stages.recognize = text == nil ? .failed : .done
+            self.store.stages.text = (text?.isEmpty ?? true) ? .failed : .done
             if let measured {
                 let status: MeasurementRecord.Status = text == nil ? .error : (text!.isEmpty ? .empty : .ok)
                 self.logMeasurement(measured, model: measuredModel, languageSetting: code, transcript: text ?? "",
@@ -470,64 +622,188 @@ final class JarvisApp: NSObject, NSApplicationDelegate {
         timeout = nil
     }
 
-    @objc private func cancelFromButton() {
-        cancelSession(message: "Скасовано. Мікрофон вимкнено.")
-    }
-
     private func cancelSession(message: String) {
         gate.cancel()
         if diagnostic.armed {
             diagnostic.cancel()
-            diagnosticButton.title = "Зберегти наступну фразу у WAV"
-            diagnosticLabel.stringValue = "Збереження скасовано. Новий файл не створено."
+            store.diagnosticArmed = false
+            store.diagnosticLabel = "Збереження скасовано. Новий файл не створено."
         }
         stopTimers()
-        audio.stop()
-        if !modelLoading { speech.cancel() }
-        processing = false
-        cancelButton.isEnabled = false
-        restoreControls()
+        wake.setMode(.off)
+        audio.stop() // keeps wake monitoring running if it is enabled
+        meter.stop()
+        if store.machine.model != .loading { speech.cancel() }
         disableEscape()
-        status.stringValue = message
-        timing.stringValue = "Поточну операцію скасовано. Раніше збережені WAV залишаються на Mac."
+        turn = nil
+        if store.stages.record == .active || store.stages.recognize == .active { store.stages = TurnStages() }
+        store.machine.cancel(message: message)
     }
 
-    private func restoreControls() {
-        diagnosticButton.isEnabled = true
-        language.isEnabled = true
-        model.isEnabled = !modelLoading
-        measureToggle.isEnabled = true
-        skipButton.isEnabled = true
+    // MARK: Voice activation
+
+    private var wakeModelDir: String { projectRoot + "/.runtime/kws/gigaspeech-3.3M" }
+
+    private func toggleWake() {
+        if store.machine.wakeEnabled {
+            disableWake(message: "")
+            return
+        }
+        guard !store.wakeLoading else { return }
+        guard store.machine.microphoneEnabled else {
+            // One explicit action: enable the mic (asking permission if needed), then activation.
+            store.pendingWake = true
+            toggleMicrophone()
+            if store.machine.microphoneEnabled { continueEnablingWake() }
+            return
+        }
+        continueEnablingWake()
     }
 
-    @objc private func toggleDiagnostic() {
-        guard !gate.recording, !processing else { return }
-        if diagnostic.armed {
-            diagnostic.cancel()
-            diagnosticButton.title = "Зберегти наступну фразу у WAV"
-            diagnosticLabel.stringValue = "Збереження аудіо вимкнено."
-        } else {
-            diagnostic.arm()
-            diagnosticButton.title = "Скасувати збереження WAV"
-            diagnosticLabel.stringValue = "Наступну фразу буде збережено локально (16 кГц WAV). Скажіть 5–8 секунд; Esc скасовує."
+    /// Called after the microphone is enabled for a pending activation request.
+    private func continueEnablingWake() {
+        store.pendingWake = false
+        guard store.machine.microphoneEnabled, !store.machine.wakeEnabled else { return }
+        store.wakeLoading = true
+        wake.load(modelDir: wakeModelDir) { [weak self] ok in
+            guard let self else { return }
+            self.store.wakeLoading = false
+            guard ok else {
+                self.store.wakeError = "Модель активації не знайдена. Запустіть scripts/setup-wake.sh."
+                return
+            }
+            guard self.store.machine.microphoneEnabled else { return }
+            do {
+                try self.audio.startMonitoring()
+            } catch {
+                self.store.wakeError = "Не вдалося увімкнути мікрофон для активації: " + error.localizedDescription
+                return
+            }
+            self.store.wakeError = ""
+            self.wake.start(capture: self.audio)
+            self.store.machine.setWake(enabled: true)
         }
     }
 
-    @objc private func revealDiagnostic() {
-        if let diagnosticURL { NSWorkspace.shared.activateFileViewerSelecting([diagnosticURL]) }
+    private func disableWake(message: String) {
+        if source == .wake && store.machine.busy { cancelSession(message: "") }
+        wake.stop()
+        audio.stopMonitoring()
+        resumeWakeOnWake = false
+        store.machine.setWake(enabled: false)
+        store.wakeError = message
+    }
+
+    private func wakeEvent(_ event: WakeListener.Event) {
+        switch event {
+        case .wake(let generation):
+            // The listener already started the command recording atomically.
+            // Accept it only if this is still an idle, armed state.
+            guard store.machine.wakeArmed, audio.recordingGeneration == generation,
+                  let id = store.machine.beginRecording() else {
+                if audio.recordingGeneration == generation { audio.stop() }
+                wake.setMode(.off)
+                if store.machine.wakeArmed { wake.setMode(.armed) }
+                return
+            }
+            source = .wake
+            store.keyRecording = false
+            beginTurnUI(id)
+        case .endpoint(let outcome):
+            guard source == .wake, store.machine.phase == .recording, let id = turn else { return }
+            switch outcome {
+            case .speechEnded:
+                finishRecording(timedOut: false)
+            case .noSpeech:
+                stopTimers()
+                meter.stop()
+                audio.stop()
+                disableEscape()
+                turn = nil
+                store.stages = TurnStages()
+                store.machine.abandon(turn: id, message: "Не почув команди після «Jarvis». Скажіть ще раз.")
+            case .listening:
+                break
+            }
+        }
+    }
+
+    private func restartMonitoring(reason: Error) {
+        wake.setMode(.off)
+        audio.stopMonitoring()
+        do {
+            try audio.startMonitoring()
+            wake.start(capture: audio)
+            if store.machine.wakeArmed { wake.setMode(.armed) }
+        } catch {
+            disableWake(message: "Активацію вимкнено: \(reason.localizedDescription)")
+        }
+    }
+
+    /// Sleep / session switch: stop every capture, remember wake monitoring.
+    private func suspendCapture(message: String) {
+        cancelSession(message: message)
+        if store.machine.wakeEnabled && audio.isMonitoring {
+            resumeWakeOnWake = true
+            wake.stop()
+            audio.stopMonitoring()
+        }
+    }
+
+    private func resumeCapture() {
+        guard resumeWakeOnWake else { return }
+        resumeWakeOnWake = false
+        guard store.machine.wakeEnabled, store.machine.microphoneEnabled else { return }
+        do {
+            try audio.startMonitoring()
+            wake.start(capture: audio)
+            if store.machine.wakeArmed { wake.setMode(.armed) }
+        } catch {
+            disableWake(message: "Не вдалося відновити активацію після сну: " + error.localizedDescription)
+        }
+    }
+
+    // MARK: Diagnostics
+
+    private func toggleDiagnostic() {
+        guard !store.machine.busy else { return }
+        if diagnostic.armed {
+            diagnostic.cancel()
+            store.diagnosticArmed = false
+            store.diagnosticLabel = "Збереження аудіо вимкнено."
+        } else {
+            diagnostic.arm()
+            store.diagnosticArmed = true
+            store.diagnosticLabel = "Наступну фразу буде збережено локально (16 кГц WAV). Скажіть 5–8 секунд; Esc скасовує."
+        }
+    }
+
+    private func revealDiagnostic() {
+        if let url = store.diagnosticURL { NSWorkspace.shared.activateFileViewerSelecting([url]) }
+    }
+
+    private func copyTranscript() {
+        guard !store.machine.transcript.isEmpty else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(store.machine.transcript, forType: .string)
     }
 
     // MARK: Measurement mode
+
+    private func setMeasuring(_ on: Bool) {
+        guard !store.machine.busy else { return }
+        store.measuring = on
+        refreshMeasurement()
+    }
 
     private func currentPrompt() -> (progress: MeasurementProgress, prompt: Prompt)? {
         guard let progress, !progress.finished, progress.index < prompts.count else { return nil }
         return (progress, prompts[progress.index])
     }
 
-    @objc private func refreshMeasurement() {
-        guard measuring else {
-            promptLabel.isHidden = true
-            skipButton.isHidden = true
+    private func refreshMeasurement() {
+        guard store.measuring else {
+            store.canSkipPrompt = false
             return
         }
         if prompts.isEmpty {
@@ -535,25 +811,24 @@ final class JarvisApp: NSObject, NSApplicationDelegate {
             prompts = PromptSet.parse((try? String(contentsOfFile: path, encoding: .utf8)) ?? "")
             measurementLog = MeasurementLog(url: URL(fileURLWithPath: projectRoot + "/.runtime/measurements/uk-en-v1.jsonl"))
         }
-        promptLabel.isHidden = false
         guard !prompts.isEmpty, let measurementLog else {
-            promptLabel.stringValue = "Не знайдено docs/benchmarks/prompts.txt."
-            skipButton.isHidden = true
+            store.measurementPrompt = "Не знайдено docs/benchmarks/prompts.txt."
+            store.canSkipPrompt = false
             return
         }
         progress = MeasurementProgress.next(records: measurementLog.records(), model: modelName,
                                             languageSetting: languageCode, promptCount: prompts.count)
         if let current = currentPrompt() {
-            promptLabel.stringValue = "Прохід \(current.progress.pass)/\(MeasurementProgress.passes) · \(current.progress.index + 1)/\(prompts.count) · [\(current.prompt.language)] \(current.prompt.text)"
-            skipButton.isHidden = false
+            store.measurementPrompt = "Прохід \(current.progress.pass)/\(MeasurementProgress.passes) · \(current.progress.index + 1)/\(prompts.count) · [\(current.prompt.language)] \(current.prompt.text)"
+            store.canSkipPrompt = true
         } else {
-            promptLabel.stringValue = "Усі \(MeasurementProgress.passes) проходи для \(modelName) / \(languageCode) записано. Запустіть scripts/analyze_measurements.py."
-            skipButton.isHidden = true
+            store.measurementPrompt = "Усі \(MeasurementProgress.passes) проходи для \(modelName) / \(languageCode) записано. Запустіть scripts/analyze_measurements.py."
+            store.canSkipPrompt = false
         }
     }
 
-    @objc private func skipPrompt() {
-        guard !gate.recording, !processing, let current = currentPrompt() else { return }
+    private func skipPrompt() {
+        guard !store.machine.busy, let current = currentPrompt() else { return }
         logMeasurement(current, model: modelName, languageSetting: languageCode, transcript: "",
                        status: .skipped, timedOut: false, audio: 0, whisper: 0, response: 0)
     }
@@ -567,23 +842,31 @@ final class JarvisApp: NSObject, NSApplicationDelegate {
             expected: current.prompt.text, transcript: transcript, status: status, timedOut: timedOut,
             audioSeconds: audio, whisperSeconds: whisper, responseSeconds: response)
         do { try measurementLog?.append(record) } catch {
-            self.status.stringValue = "Не вдалося записати вимір: \(error.localizedDescription)"
+            store.measurementPrompt = "Не вдалося записати вимір: \(error.localizedDescription)"
+            return
         }
         refreshMeasurement()
     }
 
-    @objc private func copyTranscript() {
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(transcript.string, forType: .string)
-    }
+    // MARK: Lifecycle
 
-    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+    /// Jarvis stays in the menu bar after the main window closes; Quit is explicit.
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
 
     func applicationWillTerminate(_ notification: Notification) {
-        cancelSession(message: "Завершення…")
+        cancelSession(message: "")
+        wake.stop()
+        wake.close()
+        audio.shutdown()
+        meter.stop()
+        hudHide?.invalidate()
+        hudHide = nil
+        hud.orderOut(nil)
+        stateSink = nil
         if let hotKey { UnregisterEventHotKey(hotKey) }
         if let eventHandler { RemoveEventHandler(eventHandler) }
-        for observer in observers { NSWorkspace.shared.notificationCenter.removeObserver(observer) }
+        for (center, token) in observers { center.removeObserver(token) }
+        observers.removeAll()
         speech.close()
     }
 }
