@@ -46,6 +46,12 @@ final class ActionExecutor: CommandHandling {
         }
         guard !Task.isCancelled else { return cancelled(language) }
         guard let action = parser.parse(text, language: language) else { return .notUnderstood }
+        return await handle(action: action, language: language, dictationToken: dictationToken)
+    }
+    /// Typed callers still pass through the same language/schema/cancellation gates.
+    func handle(action: Action, language: String, dictationToken: UUID? = nil) async -> CommandOutcome {
+        guard language == "uk" || language == "en" else { return .failed(reason: "Оберіть українську або англійську мову.") }
+        guard !Task.isCancelled else { return cancelled(language) }
         do { try registry.validate(action) }
         catch { return .failed(reason: actionText(language, "Некоректні параметри команди.", "Invalid command parameters.")) }
         let turnID = UUID()

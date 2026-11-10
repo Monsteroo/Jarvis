@@ -1,14 +1,14 @@
 import Foundation
 
 /// A closed action set: no shell, script, or arbitrary executable parameters.
-enum Action: Equatable, Codable {
+enum Action: Equatable, Codable, Sendable {
     case openApp(String), quitApp(String), activateApp(String)
     case openURL(String), webSearch(String)
     case windowMinimize, windowMaximize, windowLeftHalf, windowRightHalf
     case volumeSet(Int), volumeStep(Int), mute(Bool), dictate(String)
 }
 
-struct ApprovalRequest: Equatable {
+struct ApprovalRequest: Equatable, Sendable {
     let id: UUID
     let turnID: UUID
     let action: Action
@@ -16,7 +16,7 @@ struct ApprovalRequest: Equatable {
     let expiresAt: Date
 }
 
-enum CommandOutcome: Equatable {
+enum CommandOutcome: Equatable, Sendable {
     case done(summary: String)
     case partial(summary: String, details: String)
     case failed(reason: String)
