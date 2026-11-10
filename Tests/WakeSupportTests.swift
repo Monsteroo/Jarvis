@@ -65,6 +65,58 @@ struct WakeSupportTests {
         check(Array(trimmed.prefix(16_000)) == Array(spoken.prefix(16_000)), "Voice samples are untouched")
         check(SpeechEndpoint.trimTrailingSilence(silence(1)).count == 16_000, "All-silence input is left as is")
         check(SpeechEndpoint.trimTrailingSilence(voice(0.5)).count == 8_000, "No trailing silence: unchanged")
+
+        // WakeText: the command recording includes the keyword; strip it.
+        func strip(_ t: String) -> String { WakeText.stripLeadingWakeWord(t).text }
+        check(strip("Джарвіс, відкрий браузер.") == "Відкрий браузер.", "Ukrainian spelling is stripped")
+        check(strip("Jarvis, відкрий браузер.") == "Відкрий браузер.", "Latin spelling is stripped")
+        check(strip("Jarvis. Open terminal.") == "Open terminal.", "Sentence break after the keyword")
+        check(strip("Jarvis Open Terminal") == "Open Terminal", "No punctuation after the keyword")
+        check(strip("Жарвес, яка погода?") == "Яка погода?", "Misheard spelling Жарвес")
+        check(strip("Джагрес відкрий пошту") == "Відкрий пошту", "Misheard spelling Джагрес")
+        check(strip("Ну, Джарвіс, стоп.") == "Стоп.", "Words before the keyword are dropped")
+        check(WakeText.stripLeadingWakeWord("Джарвіс.") == ("", true), "Keyword alone leaves an empty command")
+        check(WakeText.stripLeadingWakeWord("Відкрий браузер.") == ("Відкрий браузер.", false), "No keyword: text unchanged")
+        check(strip("Відкрий, будь ласка, сервіс Jarvis") == "Відкрий, будь ласка, сервіс Jarvis", "Keyword after the first three words is kept")
+        check(!WakeText.isWakeWord("Чарльз") && !WakeText.isWakeWord("сервіс") && !WakeText.isWakeWord("гараж"),
+              "Unrelated words are not the keyword")
+        check(!WakeText.isWakeWord("Харків") && !WakeText.isWakeWord("Ярослав") && !WakeText.isWakeWord("Harvard"),
+              "Similar-sounding names are not the keyword")
+
+        // UtteranceSegmenter: speech segments for Parakeet screening.
+        var seg = UtteranceSegmenter()
+        check(seg.feed(silence(3), start: 0).isEmpty, "Silence produces no segment")
+        var got = seg.feed(voice(1), start: 48_000)
+        check(got.isEmpty && seg.inUtterance, "Voice opens a segment without closing it")
+        got = seg.feed(silence(1), start: 64_000)
+        check(got.count == 1, "A pause closes the segment")
+        if let u = got.first {
+            check(u.samples.count >= 16_000 && u.samples.count <= 16_000 + Int(0.4 * 16_000) + 4 * 512 + Int(0.25 * 16_000) + 512,
+                  "Segment = preroll + voice + short tail")
+            check(u.end > 64_000 && u.end <= 64_000 + Int(0.25 * 16_000) + 512, "Segment end is absolute, just after the voice")
+            check(seg.lastEnd == u.end, "Last end is remembered for de-duplication")
+        }
+        seg.reset()
+        let twoPhrases = voice(0.8) + silence(1.0) + voice(0.8) + silence(1.0)
+        check(seg.feed(twoPhrases, start: 0).count == 2, "Two phrases separated by 1 s are two segments")
+        seg.reset()
+        let withPause = voice(0.6) + silence(0.3) + voice(0.6) + silence(1.0)
+        check(seg.feed(withPause, start: 0).count == 1, "A 0.3 s pause inside a phrase does not split it")
+        seg.reset()
+        check(seg.feed([Float](repeating: 0.5, count: 512 * 2) + silence(1), start: 0).isEmpty, "A click is not a segment")
+        seg.reset()
+        let long = seg.feed(voice(13), start: 0)
+        check(long.count == 1 && long[0].samples.count <= 12 * 16_000 + 512, "Long speech is cut at 12 s")
+        seg.reset()
+        var chunked: [UtteranceSegmenter.Utterance] = []
+        let stream = silence(0.5) + voice(1) + silence(1)
+        for chunkStart in stride(from: 0, to: stream.count, by: 333) {
+            chunked += seg.feed(Array(stream[chunkStart..<min(chunkStart + 333, stream.count)]), start: chunkStart)
+        }
+        var whole = UtteranceSegmenter()
+        check(chunked == whole.feed(stream, start: 0), "Chunk boundaries do not change segments")
+        _ = seg.feed(voice(0.5), start: 1_000_000)
+        check(seg.feed(silence(1), start: 5_000_000).isEmpty && !seg.inUtterance, "A gap in sample indices starts over")
         print("WakeSupportTests: \(count) assertions passed")
     }
 }

@@ -10,7 +10,7 @@
 
 int main(int argc, char **argv) {
     // Without a model the wrapper must fail cleanly, not crash.
-    if (jw_create("/nonexistent", "\xe2\x96\x81JA R VI S @JARVIS\n", 0.25f, 1.0f, 1, 1) != NULL) {
+    if (jw_create("/nonexistent", "\xe2\x96\x81JA R V IS @JARVIS\n", 0.25f, 1.0f, 1, 1) != NULL) {
         fprintf(stderr, "expected NULL for missing model\n");
         return 1;
     }

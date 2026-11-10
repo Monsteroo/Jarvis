@@ -148,3 +148,175 @@ struct SpeechEndpoint {
         return .listening
     }
 }
+
+/// Removes the wake word from the start of a wake-started transcript.
+/// The command recording deliberately starts before the keyword, because the
+/// spotter fires 0.5–0.8 s after the word ends and an earlier cut would clip
+/// a command spoken without a pause. Parakeet spells the keyword in many ways
+/// ("Jarvis", "Джарвіс", "Жарвес", "Джагрес"), so the match is fuzzy and only
+/// looks at the first few words.
+enum WakeText {
+    static let searchWords = 3
+
+    /// Returns the command without the wake word (and anything said before it),
+    /// and whether a wake word was found. Without a match the text is unchanged.
+    static func stripLeadingWakeWord(_ text: String) -> (text: String, found: Bool) {
+        let words = text.split(whereSeparator: { $0.isWhitespace })
+        for index in 0..<min(searchWords, words.count) where isWakeWord(String(words[index])) {
+            let rest = words[(index + 1)...].joined(separator: " ")
+            let trimmed = rest.drop(while: { $0.isPunctuation || $0.isWhitespace || $0 == "—" })
+            return (trimmed.prefix(1).uppercased() + trimmed.dropFirst(), true)
+        }
+        return (text, false)
+    }
+
+    static func isWakeWord(_ word: String) -> Bool {
+        let latin = transliterate(word.lowercased().filter { $0.isLetter })
+        guard (4...9).contains(latin.count), let first = latin.first, "jgdzc".contains(first) else { return false }
+        return distance(latin, "jarvis") <= (latin.count >= 6 ? 3 : 2)
+    }
+
+    private static let table: [Character: String] = [
+        "а": "a", "б": "b", "в": "v", "г": "g", "ґ": "g", "д": "d", "е": "e", "є": "e",
+        "ж": "j", "з": "z", "и": "i", "і": "i", "ї": "i", "й": "i", "к": "k", "л": "l",
+        "м": "m", "н": "n", "о": "o", "п": "p", "р": "r", "с": "s", "т": "t", "у": "u",
+        "ф": "f", "х": "h", "ц": "c", "ч": "ch", "ш": "sh", "щ": "sh", "ь": "", "ю": "u", "я": "a",
+    ]
+
+    static func transliterate(_ word: String) -> String {
+        word.replacingOccurrences(of: "дж", with: "j").map { table[$0] ?? String($0) }.joined()
+    }
+
+    static func distance(_ a: String, _ b: String) -> Int {
+        let x = Array(a), y = Array(b)
+        var row = Array(0...y.count)
+        for i in 1...max(1, x.count) where !x.isEmpty {
+            var previous = row[0]
+            row[0] = i
+            for j in 1...max(1, y.count) where !y.isEmpty {
+                let current = row[j]
+                row[j] = min(row[j] + 1, row[j - 1] + 1, previous + (x[i - 1] == y[j - 1] ? 0 : 1))
+                previous = current
+            }
+        }
+        return x.isEmpty ? y.count : row[y.count]
+    }
+}
+
+/// Splits the armed microphone stream into speech segments for local Parakeet
+/// screening (user decision, 10 November 2026: the English keyword spotter
+/// missed most natural «Джарвіс, <команда>» phrases). Pure and allocation-bounded
+/// per segment; the owner runs it on the wake queue. Audio stays in RAM.
+struct UtteranceSegmenter {
+    struct Utterance: Equatable {
+        let samples: [Float]
+        /// Absolute sample index just after the last kept sample.
+        let end: Int
+    }
+
+    static let frame = 512
+    var speechLevel: Float = 0.12
+    var silenceLevel: Float = 0.06
+    var startFrames = 4               // ≈130 ms of voice opens a segment
+    var endSilenceSeconds = 0.7       // a pause this long closes it
+    var prerollSeconds = 0.4          // audio kept before the detected voice onset
+    var tailSeconds = 0.25            // audio kept after the last voiced frame
+    var maxSeconds = 12.0             // Parakeet limit is 15 s
+    var minVoicedSeconds = 0.25       // shorter bursts are not screened
+
+    private(set) var inUtterance = false
+    /// Absolute end of the last closed segment (emitted or not).
+    private(set) var lastEnd: Int?
+    private var pending: [Float] = []
+    private var pendingStart = 0
+    private var preroll: [Float] = []
+    private var current: [Float] = []
+    private var currentStart = 0
+    private var voiceRun = 0
+    private var voicedFrames = 0
+    private var silenceFrames = 0
+    private var lastVoicedEnd = 0
+
+    private var secondsPerFrame: Double { Double(Self.frame) / 16_000 }
+
+    mutating func reset() {
+        inUtterance = false
+        lastEnd = nil
+        pending.removeAll(keepingCapacity: true)
+        pendingStart = 0
+        preroll.removeAll(keepingCapacity: true)
+        current.removeAll(keepingCapacity: true)
+        voiceRun = 0
+        voicedFrames = 0
+        silenceFrames = 0
+        lastVoicedEnd = 0
+    }
+
+    /// Feeds samples whose first one has absolute index `start`. A gap in the
+    /// indices (a restarted monitor) starts over.
+    mutating func feed(_ samples: [Float], start: Int) -> [Utterance] {
+        if pending.isEmpty && !inUtterance && preroll.isEmpty {
+            pendingStart = start
+        } else if start != pendingStart + pending.count {
+            reset()
+            pendingStart = start
+        }
+        pending.append(contentsOf: samples)
+        var out: [Utterance] = []
+        var offset = 0
+        while pending.count - offset >= Self.frame {
+            let frame = pending[offset..<offset + Self.frame]
+            let frameStart = pendingStart + offset
+            offset += Self.frame
+            let level = SpeechEndpoint.level(frame)
+            if !inUtterance {
+                preroll.append(contentsOf: frame)
+                let cap = Int(prerollSeconds * 16_000) + startFrames * Self.frame
+                if preroll.count > cap { preroll.removeFirst(preroll.count - cap) }
+                voiceRun = level >= speechLevel ? voiceRun + 1 : 0
+                if voiceRun >= startFrames {
+                    inUtterance = true
+                    current = preroll
+                    currentStart = frameStart + Self.frame - current.count
+                    preroll.removeAll(keepingCapacity: true)
+                    voicedFrames = voiceRun
+                    silenceFrames = 0
+                    lastVoicedEnd = current.count
+                }
+            } else {
+                current.append(contentsOf: frame)
+                if level >= speechLevel {
+                    voicedFrames += 1
+                    silenceFrames = 0
+                    lastVoicedEnd = current.count
+                } else if level < silenceLevel {
+                    silenceFrames += 1
+                }
+                if Double(silenceFrames) * secondsPerFrame >= endSilenceSeconds {
+                    close(keep: min(current.count, lastVoicedEnd + Int(tailSeconds * 16_000)), into: &out)
+                } else if Double(current.count) >= maxSeconds * 16_000 {
+                    close(keep: current.count, into: &out)
+                }
+            }
+        }
+        pending.removeFirst(offset)
+        pendingStart += offset
+        return out
+    }
+
+    private mutating func close(keep: Int, into out: inout [Utterance]) {
+        let end = currentStart + keep
+        if Double(voicedFrames) * secondsPerFrame >= minVoicedSeconds {
+            out.append(Utterance(samples: Array(current.prefix(keep)), end: end))
+        }
+        lastEnd = end
+        // The silence after the segment becomes preroll for the next one.
+        let cap = Int(prerollSeconds * 16_000) + startFrames * Self.frame
+        preroll = Array(current.suffix(min(cap, current.count - keep)))
+        current.removeAll(keepingCapacity: true)
+        inUtterance = false
+        voiceRun = 0
+        voicedFrames = 0
+        silenceFrames = 0
+    }
+}

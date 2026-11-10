@@ -4,23 +4,24 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* Two staggered streams, each restarted every JW_AGE samples. Measured on
- * v2.0.1 + gigaspeech 3.3M: a single long-running stream misses the keyword
- * after ~10 s of silence or room noise. With a 3 s offset every keyword up to
- * 3 s long lies entirely inside a fresh stream. */
-#define JW_AGE (16000 * 6)
-#define JW_OFFSET (16000 * 3)
+/* One stream. Measured on v2.0.1 + streaming zipformer en-2023-06-26 int8:
+ * the keyword still fires after 600 s of room-like noise and after 60 s of
+ * silence, so the two staggered streams the 3.3M gigaspeech model needed are
+ * gone (they doubled CPU). The stream is still renewed every JW_AGE samples as
+ * a precaution against unmeasured multi-hour drift; a keyword spoken across
+ * that boundary (≈1.5 s in 600 s) can be missed. */
+#define JW_AGE (16000 * 600)
 
 struct jw_spotter {
     const SherpaOnnxKeywordSpotter *spotter;
-    const SherpaOnnxOnlineStream *stream[2];
-    int age[2];
+    const SherpaOnnxOnlineStream *stream;
+    int age;
 };
 
-static void jw_reopen(jw_spotter *s, int k, int age) {
-    if (s->stream[k]) SherpaOnnxDestroyOnlineStream(s->stream[k]);
-    s->stream[k] = SherpaOnnxCreateKeywordStream(s->spotter);
-    s->age[k] = age;
+static void jw_reopen(jw_spotter *s) {
+    if (s->stream) SherpaOnnxDestroyOnlineStream(s->stream);
+    s->stream = SherpaOnnxCreateKeywordStream(s->spotter);
+    s->age = 0;
 }
 
 static char *join(const char *dir, const char *name) {
@@ -33,9 +34,9 @@ static char *join(const char *dir, const char *name) {
 jw_spotter *jw_create(const char *model_dir, const char *keywords,
                       float threshold, float score, int trailing_blanks, int threads) {
     if (!model_dir || !keywords) return NULL;
-    char *encoder = join(model_dir, "encoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx");
-    char *decoder = join(model_dir, "decoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx");
-    char *joiner = join(model_dir, "joiner-epoch-12-avg-2-chunk-16-left-64.int8.onnx");
+    char *encoder = join(model_dir, "encoder.onnx");
+    char *decoder = join(model_dir, "decoder.onnx");
+    char *joiner = join(model_dir, "joiner.onnx");
     char *tokens = join(model_dir, "tokens.txt");
     jw_spotter *result = NULL;
     if (encoder && decoder && joiner && tokens) {
@@ -50,7 +51,8 @@ jw_spotter *jw_create(const char *model_dir, const char *keywords,
         config.model_config.num_threads = threads > 0 ? threads : 1;
         config.model_config.provider = "cpu";
         config.model_config.debug = 0;
-        config.max_active_paths = 4;
+        /* 8 paths: 12/13 real-voice hits vs 10/13 with 4, same CPU (measured). */
+        config.max_active_paths = 8;
         config.num_trailing_blanks = trailing_blanks;
         config.keywords_score = score;
         config.keywords_threshold = threshold;
@@ -61,9 +63,8 @@ jw_spotter *jw_create(const char *model_dir, const char *keywords,
             result = calloc(1, sizeof(jw_spotter));
             if (result) {
                 result->spotter = spotter;
-                jw_reopen(result, 0, 0);
-                jw_reopen(result, 1, JW_OFFSET);
-                if (!result->stream[0] || !result->stream[1]) { jw_free(result); result = NULL; }
+                jw_reopen(result);
+                if (!result->stream) { jw_free(result); result = NULL; }
             } else {
                 SherpaOnnxDestroyKeywordSpotter(spotter);
             }
@@ -75,7 +76,7 @@ jw_spotter *jw_create(const char *model_dir, const char *keywords,
 
 void jw_free(jw_spotter *s) {
     if (!s) return;
-    for (int k = 0; k < 2; k++) if (s->stream[k]) SherpaOnnxDestroyOnlineStream(s->stream[k]);
+    if (s->stream) SherpaOnnxDestroyOnlineStream(s->stream);
     if (s->spotter) SherpaOnnxDestroyKeywordSpotter(s->spotter);
     free(s);
 }
@@ -93,13 +94,10 @@ static int jw_feed(jw_spotter *s, const SherpaOnnxOnlineStream *stream, const fl
 }
 
 int jw_accept(jw_spotter *s, const float *samples, int count, float *end_seconds) {
-    if (!s || !s->stream[0] || !s->stream[1] || !samples || count <= 0) return 0;
-    int fired = 0;
-    for (int k = 0; k < 2 && !fired; k++) {
-        fired = jw_feed(s, s->stream[k], samples, count);
-        s->age[k] += count;
-        if (!fired && s->age[k] >= JW_AGE) jw_reopen(s, k, 0);
-    }
+    if (!s || !s->stream || !samples || count <= 0) return 0;
+    int fired = jw_feed(s, s->stream, samples, count);
+    s->age += count;
+    if (!fired && s->age >= JW_AGE) jw_reopen(s);
     if (fired) {
         /* sherpa timestamps are not absolute; callers use the detection time. */
         if (end_seconds) *end_seconds = 0;
@@ -110,6 +108,5 @@ int jw_accept(jw_spotter *s, const float *samples, int count, float *end_seconds
 
 void jw_restart(jw_spotter *s) {
     if (!s) return;
-    jw_reopen(s, 0, 0);
-    jw_reopen(s, 1, JW_OFFSET);
+    jw_reopen(s);
 }

@@ -46,7 +46,7 @@ swiftc "${SWIFT_FLAGS[@]}" -swift-version 5 -O -parse-as-library Sources/Parakee
 python3 -I -m unittest discover -s Tests -p 'test_*.py' -q
 # Wake word: pinned sherpa-onnx v2.0.1 static libs + English KWS model (scripts/setup-wake.sh).
 SHERPA="$ROOT/.runtime/sherpa-onnx-v2.0.1"
-KWS="$ROOT/.runtime/kws/gigaspeech-3.3M"
+KWS="$ROOT/.runtime/kws/en-2023-06-26"
 if [[ ! -f "$SHERPA/lib/libsherpa-onnx-c-api.a" || ! -f "$KWS/tokens.txt" ]]; then
   echo "error: wake-word runtime missing; run scripts/setup-wake.sh" >&2
   exit 1
@@ -58,7 +58,7 @@ clang++ -mmacosx-version-min=14.0 -ISources -I"$SHERPA/include" -x c Tests/wake_
 .build/wake-bridge-test 2>/dev/null
 [[ -d .runtime/wake-fixtures/pos ]] || bash scripts/wake_fixtures.sh
 # Synthetic regression gate only (system voices), not a real-voice accuracy claim.
-WAKE_OUT=$(.build/wake-bridge-test "$KWS" <(printf '\xe2\x96\x81JA R VI S @JARVIS\n') 0.15 1.0 .runtime/wake-fixtures/pos/*.wav .runtime/wake-fixtures/neg/*.wav 2>/dev/null)
+WAKE_OUT=$(.build/wake-bridge-test "$KWS" <(printf '\xe2\x96\x81JA R V IS @JARVIS\n') 0.15 1.0 .runtime/wake-fixtures/pos/*.wav .runtime/wake-fixtures/neg/*.wav 2>/dev/null)
 WAKE_POS_ALL=$(echo "$WAKE_OUT" | grep -c -E '^jarvis' || true)
 WAKE_NEG_ALL=$(echo "$WAKE_OUT" | grep -c -v -E '^jarvis' || true)
 WAKE_POS=$(echo "$WAKE_OUT" | grep -E '^jarvis' | awk '$2>0' | wc -l | tr -d ' ')
@@ -85,7 +85,7 @@ mkdir -p "$APP/Contents/Resources"
 cp "$W/LICENSE" "$APP/Contents/Resources/whisper-LICENSE"
 cp THIRD_PARTY.md "$APP/Contents/Resources/THIRD_PARTY.md"
 cp "$SHERPA/LICENSE" "$APP/Contents/Resources/sherpa-onnx-LICENSE"
-cp "$KWS/README.md" "$APP/Contents/Resources/kws-gigaspeech-README.md"
+cp "$KWS/README.md" "$APP/Contents/Resources/kws-zipformer-en-2023-06-26-README.md"
 codesign --force --sign - "$APP"
 codesign --verify --strict "$APP"
 fi

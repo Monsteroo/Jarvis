@@ -92,6 +92,24 @@ final class LocalSpeech {
         lock.unlock()
     }
 
+    /// Wake screening: transcribes one speech segment with Parakeet without
+    /// touching turn generations, so it never drops or replaces a command
+    /// result. Runs on the same serial queue (after any queued command).
+    /// Always completes on main; nil when Parakeet is not the loaded model,
+    /// on failure, or when a turn cancel interrupted it.
+    func screen(_ samples: [Float], language: String, completion: @escaping (String?, Double) -> Void) {
+        queue.async {
+            self.lock.lock()
+            let parakeet = self.closing ? nil : self.parakeet
+            parakeet?.resetCancellation()
+            self.lock.unlock()
+            let start = ProcessInfo.processInfo.systemUptime
+            let text = parakeet.flatMap { try? $0.transcribe(samples, language: language) }
+            let elapsed = ProcessInfo.processInfo.systemUptime - start
+            DispatchQueue.main.async { completion(text, elapsed) }
+        }
+    }
+
     func close() {
         lock.lock()
         closing = true
@@ -133,6 +151,12 @@ final class JarvisApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Opt-in developer check (JARVIS_DEBUG_LEVELS=1): prints envelope numbers
     /// twice a second to stderr. Numbers only — never audio samples.
     private let debugLevels = ProcessInfo.processInfo.environment["JARVIS_DEBUG_LEVELS"] == "1"
+    /// Opt-in wake pipeline trace (JARVIS_DEBUG_WAKE=1): events and durations only, never text or audio.
+    private let debugWake = ProcessInfo.processInfo.environment["JARVIS_DEBUG_WAKE"] == "1"
+    private func wakeTrace(_ text: String) {
+        guard debugWake else { return }
+        FileHandle.standardError.write(("app " + text + "\n").data(using: .utf8)!)
+    }
     private var debugPeak: Float = 0
     private var debugStamp = 0.0
     private var window: NSWindow!
@@ -144,6 +168,12 @@ final class JarvisApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let audio = AudioCapture()
     private let speech = LocalSpeech()
     private lazy var wake = WakeListener { [weak self] in self?.wakeEvent($0) }
+    /// Parakeet screening of speech segments while wake is armed (user
+    /// decision, 10 Nov 2026). One in flight, at most one pending (the newest).
+    private struct Segment { let samples: [Float]; let end: Int; let epoch: Int; let heardAt: Double }
+    private var screenToken = 0
+    private var screenBusy = false
+    private var screenPending: Segment?
     private enum RecordSource { case ptt, wake }
     private var source: RecordSource = .ptt
     /// Wake monitoring was running before sleep / session switch.
@@ -528,6 +558,8 @@ final class JarvisApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     /// Shared by PTT and wake-started turns once audio is being recorded.
     private func beginTurnUI(_ id: Int) {
+        screenToken += 1   // a pending screening result must not start a second turn
+        screenPending = nil
         turn = id
         started = ProcessInfo.processInfo.systemUptime
         store.recordElapsed = 0
@@ -563,6 +595,7 @@ final class JarvisApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // words. PTT audio is kept exactly as recorded (measurement baseline).
         let samples = source == .wake ? SpeechEndpoint.trimTrailingSilence(recorded) : recorded
         let duration = Double(samples.count) / 16_000
+        if source == .wake { wakeTrace(String(format: "command recorded %.2f s, after trim %.2f s", Double(recorded.count) / 16_000, duration)) }
         let wasDiagnostic = diagnostic.armed
         if wasDiagnostic {
             store.diagnosticArmed = false
@@ -595,8 +628,23 @@ final class JarvisApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let code = languageCode
         let measured = store.measuring && !wasDiagnostic ? currentPrompt() : nil
         let measuredModel = modelName
-        speech.transcribe(samples, language: code) { [weak self] text, elapsed in
+        let fromWake = source == .wake
+        speech.transcribe(samples, language: code) { [weak self] raw, elapsed in
             guard let self else { return }
+            var text = raw
+            if fromWake, let heard = raw {
+                let stripped = WakeText.stripLeadingWakeWord(heard)
+                text = stripped.text
+                self.wakeTrace(String(format: "asr done %.2f s, chars=%d, keyword=%@, command chars=%d",
+                                      elapsed, heard.count, stripped.found ? "yes" : "no", stripped.text.count))
+                if stripped.text.isEmpty, self.store.machine.phase == .transcribing, self.turn == id {
+                    self.turn = nil
+                    self.disableEscape()
+                    self.store.stages = TurnStages()
+                    self.store.machine.abandon(turn: id, message: "Не почув команди після «Jarvis». Скажіть ще раз.")
+                    return
+                }
+            }
             // Stale results of cancelled turns are dropped by both LocalSpeech
             // generations and the turn id.
             guard self.store.machine.finishTranscription(turn: id, text: text) else { return }
@@ -642,7 +690,7 @@ final class JarvisApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: Voice activation
 
-    private var wakeModelDir: String { projectRoot + "/.runtime/kws/gigaspeech-3.3M" }
+    private var wakeModelDir: String { projectRoot + "/.runtime/kws/en-2023-06-26" }
 
     private func toggleWake() {
         if store.machine.wakeEnabled {
@@ -696,11 +744,16 @@ final class JarvisApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func wakeEvent(_ event: WakeListener.Event) {
         switch event {
+        case .utterance(let samples, let end, let epoch):
+            let segment = Segment(samples: samples, end: end, epoch: epoch, heardAt: ProcessInfo.processInfo.systemUptime)
+            if screenBusy { screenPending = segment } else { screen(segment) }
         case .wake(let generation):
             // The listener already started the command recording atomically.
             // Accept it only if this is still an idle, armed state.
+            wakeTrace("wake gen=\(generation) armed=\(store.machine.wakeArmed) phase=\(store.machine.phase) recGen=\(String(describing: audio.recordingGeneration))")
             guard store.machine.wakeArmed, audio.recordingGeneration == generation,
                   let id = store.machine.beginRecording() else {
+                wakeTrace("wake rejected")
                 if audio.recordingGeneration == generation { audio.stop() }
                 wake.setMode(.off)
                 if store.machine.wakeArmed { wake.setMode(.armed) }
@@ -710,22 +763,67 @@ final class JarvisApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             store.keyRecording = false
             beginTurnUI(id)
         case .endpoint(let outcome):
-            guard source == .wake, store.machine.phase == .recording, let id = turn else { return }
+            wakeTrace("endpoint \(outcome) source=\(source) phase=\(store.machine.phase)")
+            guard source == .wake, store.machine.phase == .recording, turn != nil else { return }
             switch outcome {
             case .speechEnded:
                 finishRecording(timedOut: false)
             case .noSpeech:
-                stopTimers()
-                meter.stop()
-                audio.stop()
-                disableEscape()
-                turn = nil
-                store.stages = TurnStages()
-                store.machine.abandon(turn: id, message: "Не почув команди після «Jarvis». Скажіть ще раз.")
+                // The recording starts before the keyword, so a short command
+                // said in one breath ("Джарвіс, стоп") may already be in it.
+                // Transcribe; an empty command after stripping is abandoned.
+                finishRecording(timedOut: false)
             case .listening:
                 break
             }
         }
+    }
+
+    private var canScreen: Bool {
+        modelName == "parakeet-uk-v3" && store.machine.wakeArmed && !store.machine.busy
+    }
+
+    private func screen(_ segment: Segment) {
+        guard canScreen else { return }
+        screenBusy = true
+        screenToken += 1
+        let token = screenToken
+        speech.screen(segment.samples, language: languageCode) { [weak self] heard, elapsed in
+            guard let self else { return }
+            self.screenBusy = false
+            defer {
+                if let next = self.screenPending {
+                    self.screenPending = nil
+                    self.screen(next)
+                }
+            }
+            guard token == self.screenToken, self.canScreen, let heard else { return }
+            let stripped = WakeText.stripLeadingWakeWord(heard)
+            // Counts only: the transcript of non-wake speech is never logged.
+            self.wakeTrace(String(format: "screen %.2f s audio, asr %.2f s, keyword=%@, command chars=%d",
+                                  Double(segment.samples.count) / 16_000, elapsed,
+                                  stripped.found ? "yes" : "no", stripped.found ? stripped.text.count : -1))
+            guard stripped.found else { return }
+            if stripped.text.isEmpty {
+                // "Джарвіс" alone: the next phrase is the command.
+                self.wake.startCommand(after: segment.end, epoch: segment.epoch)
+                return
+            }
+            self.presentScreenedCommand(stripped.text, segment: segment, asrSeconds: elapsed)
+        }
+    }
+
+    /// The whole «Джарвіс, <команда>» phrase was already heard and recognised.
+    private func presentScreenedCommand(_ text: String, segment: Segment, asrSeconds: Double) {
+        guard let id = store.machine.beginRecording() else { return }
+        source = .wake
+        screenPending = nil
+        store.stages = TurnStages(record: .done, recognize: .done, text: .done,
+                                  audioSeconds: Double(segment.samples.count) / 16_000,
+                                  asrSeconds: asrSeconds,
+                                  responseSeconds: ProcessInfo.processInfo.systemUptime - segment.heardAt)
+        store.machine.beginTranscribing(turn: id, timedOut: false)
+        _ = store.machine.finishTranscription(turn: id, text: text)
     }
 
     private func restartMonitoring(reason: Error) {

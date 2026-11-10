@@ -11,15 +11,29 @@ final class WakeListener {
         case wake(generation: Int)
         /// End-of-speech decision for the wake-started command.
         case endpoint(SpeechEndpoint.Outcome)
+        /// A speech segment heard while armed, for local Parakeet screening.
+        /// Dropped by the owner unless its transcript starts with the wake word.
+        case utterance(samples: [Float], end: Int, epoch: Int)
     }
 
-    /// BPE tokens of "JARVIS" from the model's own bpe.model (sentencepiece).
-    static let keywords = "\u{2581}JA R VI S @JARVIS\n"
-    /// Starting point from the synthetic fixture sweep; tune on real voices.
+    /// BPE tokens of "JARVIS" in the en-2023-06-26 vocabulary, as the model
+    /// itself decodes the word ("VI" is not a token there).
+    static let keywords = "\u{2581}JA R V IS @JARVIS\n"
+    /// Real-voice check with 8 search paths: 12/13 hits on two recordings and
+    /// 0 false fires on ordinary speech (docs/research/2026-11-10-wake-real-voice.md).
+    /// 0.15 keeps the synthetic set at 16/17; 0.25 drops it to 15/17.
     var threshold: Float = 0.15
     var score: Float = 1.0
     static let commandSeconds = 15
-    static let detectionLag = 0.15
+    /// The command recording starts this far before the detection so it holds
+    /// the whole keyword: en-2023-06-26 fires 0.5–0.8 s after the word ends
+    /// (≈1.3 s after it starts), and a later cut clipped commands spoken
+    /// without a pause ("…відкрий браузер" → "Browser."). The keyword is then
+    /// removed from the transcript (WakeText).
+    static let commandLookback = 1.5
+    /// End-of-speech detection starts here, so the keyword itself does not
+    /// count as the command and a pause after "Jarvis" is still allowed.
+    static let endpointLookback = 0.15
 
     private let queue = DispatchQueue(label: "jarvis.wake", qos: .userInitiated)
     private let lock = NSLock()
@@ -37,6 +51,10 @@ final class WakeListener {
     private var needsRestart = true
     private var cooldownUntil = 0
     private var endpoint = SpeechEndpoint()
+    private var segmenter = UtteranceSegmenter()
+    /// A keyword hit this soon after a screened segment ended belongs to that
+    /// segment (the spotter lags 0.5–0.8 s); screening handles it, not a second turn.
+    static let screenedOverlap = 1.5
     /// Opt-in developer check (JARVIS_DEBUG_WAKE=1): numbers only, never audio.
     private let debug = ProcessInfo.processInfo.environment["JARVIS_DEBUG_WAKE"] == "1"
     private var debugSamples = 0
@@ -92,7 +110,7 @@ final class WakeListener {
         if newMode == .armed && mode != .off { return }
         if newMode != mode { session += 1 }
         mode = newMode
-        if newMode == .armed { queue.async { self.needsRestart = true } }
+        if newMode == .armed { queue.async { self.needsRestart = true; self.segmenter.reset() } }
     }
 
     var currentMode: Mode { lock.lock(); defer { lock.unlock() }; return mode }
@@ -113,6 +131,11 @@ final class WakeListener {
             history.removeAll(keepingCapacity: true)
             historyStart = chunk.start
             needsRestart = true
+            // Sample indices restart with the monitor; a cooldown from the old
+            // time base would silently swallow detections (seen live: a hit
+            // ignored after re-enabling wake).
+            cooldownUntil = 0
+            segmenter.reset()
         }
         history.append(contentsOf: chunk.samples)
         let keep = 16_000 * 3
@@ -146,6 +169,7 @@ final class WakeListener {
         case .command:
             let outcome = endpoint.feed(chunk.samples)
             guard outcome != .listening else { return }
+            debugLog("endpoint=\(outcome) heardSpeech=\(endpoint.heardSpeech)")
             lock.lock()
             let current = self.mode == .command && session == ticket
             if current { self.mode = .off; session += 1 }
@@ -157,19 +181,28 @@ final class WakeListener {
                 jw_restart(spotter)
                 needsRestart = false
             }
+            let epochNow = epoch
+            for utterance in segmenter.feed(chunk.samples, start: chunk.start) {
+                debugLog(String(format: "utterance %.2f s", Double(utterance.samples.count) / 16_000))
+                DispatchQueue.main.async {
+                    self.onEvent(.utterance(samples: utterance.samples, end: utterance.end, epoch: epochNow))
+                }
+            }
             var unused: Float = 0
             let fired = chunk.samples.withUnsafeBufferPointer {
                 jw_accept(spotter, $0.baseAddress, Int32($0.count), &unused)
             }
             guard fired == 1 else { return }
             let drainedEnd = chunk.start + chunk.samples.count
-            debugLog("fired at=\(drainedEnd)")
+            debugLog("fired at=\(drainedEnd) cooldown=\(drainedEnd < cooldownUntil)")
             guard drainedEnd >= cooldownUntil else { return }
+            if !segmenter.inUtterance, let last = segmenter.lastEnd,
+               drainedEnd - last < Int(Self.screenedOverlap * 16_000) {
+                debugLog("fired inside a screened segment; left to screening")
+                return
+            }
             cooldownUntil = drainedEnd + 16_000 * 2
-            // Detection lands 0.32–0.52 s after the spoken word ends (measured
-            // on fixtures). Live test: starting 0.30 s back left the "s" of
-            // "Jarvis" in the command, so start 0.15 s back.
-            let cut = max(historyStart, drainedEnd - Int(Self.detectionLag * 16_000))
+            let cut = max(historyStart, drainedEnd - Int(Self.commandLookback * 16_000))
             let seed = cut < drainedEnd ? Array(history[(cut - historyStart)...]) : []
             lock.lock()
             guard self.mode == .armed, session == ticket else { lock.unlock(); return }
@@ -178,11 +211,44 @@ final class WakeListener {
                 self.mode = .command
                 session += 1
                 endpoint.reset()
-                _ = endpoint.feed(seed)
+                _ = endpoint.feed(Array(seed.suffix(Int(Self.endpointLookback * 16_000))))
             }
             lock.unlock()
             needsRestart = true
+            segmenter.reset()
             if let generation { DispatchQueue.main.async { self.onEvent(.wake(generation: generation)) } }
+        }
+    }
+
+    /// Screening heard the wake word alone: record the next phrase as the
+    /// command, starting from the end of that segment so nothing said during
+    /// screening is lost. Main thread.
+    func startCommand(after end: Int, epoch expected: Int) {
+        queue.async {
+            guard let capture = self.capture, expected == self.epoch else { return }
+            let historyEnd = self.historyStart + self.history.count
+            let from = min(max(end, self.historyStart), historyEnd)
+            let seed = Array(self.history[(from - self.historyStart)...])
+            self.lock.lock()
+            guard self.mode == .armed else { self.lock.unlock(); return }
+            let generation = capture.beginRecording(seed: seed, maximumSeconds: Self.commandSeconds)
+            var outcome = SpeechEndpoint.Outcome.listening
+            if generation != nil {
+                self.mode = .command
+                self.session += 1
+                self.endpoint.reset()
+                outcome = self.endpoint.feed(seed)
+                if outcome != .listening { self.mode = .off; self.session += 1 }
+            }
+            self.lock.unlock()
+            self.needsRestart = true
+            self.segmenter.reset()
+            self.debugLog(String(format: "command after screened keyword, seed %.2f s", Double(seed.count) / 16_000))
+            guard let generation else { return }
+            DispatchQueue.main.async {
+                self.onEvent(.wake(generation: generation))
+                if outcome != .listening { self.onEvent(.endpoint(outcome)) }
+            }
         }
     }
 }
