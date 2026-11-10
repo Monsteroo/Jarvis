@@ -8,6 +8,7 @@ final class LocalSpeech {
     private let queue = DispatchQueue(label: "jarvis.inference", qos: .userInitiated)
     private let lock = NSLock()
     private var context: UnsafeMutableRawPointer?
+    private var parakeet: ParakeetASR?
     private var generation = 0
     private var closing = false
 
@@ -20,17 +21,21 @@ final class LocalSpeech {
             self.lock.lock()
             if let previous = self.context { jv_free(previous) }
             self.context = nil
+            self.parakeet = nil
             self.lock.unlock()
-            let context = path.withCString { jv_create($0) }
+            let isParakeet = !path.hasSuffix(".bin")
+            let parakeet = isParakeet ? try? ParakeetASR(root: URL(fileURLWithPath:path)) : nil
+            let context = isParakeet ? nil : path.withCString { jv_create($0) }
             self.lock.lock()
             self.context = context
+            self.parakeet = parakeet
             let closing = self.closing
             self.lock.unlock()
             DispatchQueue.main.async {
                 self.lock.lock()
                 let valid = ticket == self.generation
                 self.lock.unlock()
-                if !closing && valid { completion(context != nil) }
+                if !closing && valid { completion(context != nil || parakeet != nil) }
             }
         }
     }
@@ -41,21 +46,29 @@ final class LocalSpeech {
         lock.unlock()
         queue.async {
             self.lock.lock()
-            guard !self.closing, ticket == self.generation, let context = self.context else {
+            guard !self.closing, ticket == self.generation, self.context != nil || self.parakeet != nil else {
                 self.lock.unlock()
                 return
             }
-            jv_reset_cancel(context)
+            let context = self.context
+            let parakeet = self.parakeet
+            if let context { jv_reset_cancel(context) }
+            parakeet?.resetCancellation()
             self.lock.unlock()
             let start = ProcessInfo.processInfo.systemUptime
-            var output = [CChar](repeating: 0, count: 65_536)
-            let result = samples.withUnsafeBufferPointer { audio in
-                language.withCString { lang in
-                    jv_transcribe(context, audio.baseAddress, Int32(audio.count), lang, &output, Int32(output.count))
+            let text: String?
+            if let parakeet {
+                text = try? parakeet.transcribe(samples,language:language)
+            } else if let context {
+                var output = [CChar](repeating: 0, count: 65_536)
+                let result = samples.withUnsafeBufferPointer { audio in
+                    language.withCString { lang in
+                        jv_transcribe(context, audio.baseAddress, Int32(audio.count), lang, &output, Int32(output.count))
+                    }
                 }
-            }
+                text = result == 1 ? "" : (result == 0 ? String(cString:output).trimmingCharacters(in:.whitespacesAndNewlines) : nil)
+            } else { text = nil }
             let elapsed = ProcessInfo.processInfo.systemUptime - start
-            let text = result == 1 ? "" : (result == 0 ? String(cString: output).trimmingCharacters(in: .whitespacesAndNewlines) : nil)
             DispatchQueue.main.async {
                 self.lock.lock()
                 let valid = !self.closing && ticket == self.generation
@@ -69,6 +82,7 @@ final class LocalSpeech {
         lock.lock()
         generation += 1
         if let context { jv_cancel(context) }
+        parakeet?.cancel()
         lock.unlock()
     }
 
@@ -77,11 +91,13 @@ final class LocalSpeech {
         closing = true
         generation += 1
         if let context { jv_cancel(context) }
+        parakeet?.cancel()
         lock.unlock()
         queue.async {
             self.lock.lock()
             if let context = self.context { jv_free(context) }
             self.context = nil
+            self.parakeet = nil
             self.lock.unlock()
         }
     }
@@ -132,7 +148,9 @@ final class JarvisApp: NSObject, NSApplicationDelegate {
     private var projectRoot: String {
         Bundle.main.object(forInfoDictionaryKey: "JarvisProjectRoot") as? String ?? FileManager.default.currentDirectoryPath
     }
-    private var modelName: String { model.indexOfSelectedItem == 1 ? "small" : "base" }
+    private let modelNames = ["parakeet-uk-v3", "small", "base"]
+    private var modelName: String { modelNames[max(0,model.indexOfSelectedItem)] }
+    private var recordingLimit: Int { modelName == "parakeet-uk-v3" ? 15 : 30 }
     private var languageCode: String { ["uk", "en"][max(0, language.indexOfSelectedItem)] }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -168,14 +186,14 @@ final class JarvisApp: NSObject, NSApplicationDelegate {
         window.center()
         let heading = NSTextField(labelWithString: "Jarvis")
         heading.font = .systemFont(ofSize: 30, weight: .semibold)
-        let hint = NSTextField(wrappingLabelWithString: "Утримуйте ⌃⌥Пробіл, говоріть і відпустіть для розпізнавання. Esc — скасувати. Максимум 30 секунд.")
+        let hint = NSTextField(wrappingLabelWithString: "Утримуйте ⌃⌥Пробіл, говоріть і відпустіть для розпізнавання. Esc — скасувати. Максимум 15 с для Parakeet, 30 с для Whisper.")
         status.font = .systemFont(ofSize: 14, weight: .medium)
         timing.font = .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
         timing.textColor = .secondaryLabelColor
         language.addItems(withTitles: ["Українська", "English"])
         language.toolTip = "Мова розпізнавання"
         language.setAccessibilityLabel("Мова розпізнавання")
-        model.addItems(withTitles: ["base", "small"])
+        model.addItems(withTitles: ["Parakeet UK", "Whisper small", "Whisper base"])
         model.target = self
         model.action = #selector(loadSelectedModel)
         model.setAccessibilityLabel("Локальна модель")
@@ -249,7 +267,10 @@ final class JarvisApp: NSObject, NSApplicationDelegate {
         model.isEnabled = false
         status.stringValue = "Завантаження локальної моделі…"
         refreshMeasurement()
-        speech.load(path: projectRoot + "/.runtime/models/ggml-" + modelName + ".bin") { [weak self] ready in
+        let path = modelName == "parakeet-uk-v3"
+            ? projectRoot + "/.runtime/parakeet-probe/model/parakeet-tdt-0.6b-v3"
+            : projectRoot + "/.runtime/models/ggml-" + modelName + ".bin"
+        speech.load(path: path) { [weak self] ready in
             guard let self else { return }
             self.modelLoading = false
             self.modelReady = ready
@@ -350,7 +371,7 @@ final class JarvisApp: NSObject, NSApplicationDelegate {
     private func keyDown() {
         let authorized = AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
         guard gate.press(enabled: enabled, authorized: authorized, ready: modelReady && !processing && hotKeyAvailable) else { return }
-        do { try audio.start() } catch {
+        do { try audio.start(maximumSeconds: recordingLimit) } catch {
             cancelSession(message: error.localizedDescription)
             return
         }
@@ -362,14 +383,14 @@ final class JarvisApp: NSObject, NSApplicationDelegate {
         measureToggle.isEnabled = false
         skipButton.isEnabled = false
         status.stringValue = "● Слухаю… Відпустіть ⌃⌥Пробіл для розпізнавання."
-        timing.stringValue = "Запис: 0,0 с / 30 с"
+        timing.stringValue = "Запис: 0,0 с / \(recordingLimit) с"
         enableEscape()
         clock = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
             guard let self else { return }
             let elapsed = ProcessInfo.processInfo.systemUptime - self.started
-            self.timing.stringValue = String(format: "Запис: %.1f с / 30 с", elapsed)
+            self.timing.stringValue = String(format: "Запис: %.1f с / %d с", elapsed, self.recordingLimit)
         }
-        timeout = Timer.scheduledTimer(withTimeInterval: 30, repeats: false) { [weak self] _ in
+        timeout = Timer.scheduledTimer(withTimeInterval: Double(recordingLimit), repeats: false) { [weak self] _ in
             self?.finishRecording(timedOut: true)
         }
         if let clock { RunLoop.main.add(clock, forMode: .common) }
@@ -416,7 +437,7 @@ final class JarvisApp: NSObject, NSApplicationDelegate {
         let code = languageCode
         let measured = measuring && !wasDiagnostic ? currentPrompt() : nil
         let measuredModel = modelName
-        status.stringValue = timedOut ? "Досягнуто 30 с. Мікрофон вимкнено, розпізнаю…" : "Мікрофон вимкнено. Розпізнаю локально…"
+        status.stringValue = timedOut ? "Досягнуто ліміту запису. Мікрофон вимкнено, розпізнаю…" : "Мікрофон вимкнено. Розпізнаю локально…"
         timing.stringValue = String(format: "Аудіо: %.1f с · розпізнавання…", duration)
         speech.transcribe(samples, language: code) { [weak self] text, elapsed in
             guard let self else { return }
@@ -432,8 +453,8 @@ final class JarvisApp: NSObject, NSApplicationDelegate {
             } else {
                 self.status.stringValue = "Помилка локального розпізнавання. Спробуйте ще раз."
             }
-            self.timing.stringValue = String(format: "Аудіо: %.1f с · Whisper: %.2f с · відповідь: %.2f с", duration, elapsed, responseTime)
-            self.timing.toolTip = "Відповідь — час від відпускання клавіші (або ліміту 30 с) до появи тексту."
+            self.timing.stringValue = String(format: "Аудіо: %.1f с · ASR: %.2f с · відповідь: %.2f с", duration, elapsed, responseTime)
+            self.timing.toolTip = "Відповідь — час від відпускання клавіші (або ліміту запису) до появи тексту."
             if let measured {
                 let status: MeasurementRecord.Status = text == nil ? .error : (text!.isEmpty ? .empty : .ok)
                 self.logMeasurement(measured, model: measuredModel, languageSetting: code, transcript: text ?? "",

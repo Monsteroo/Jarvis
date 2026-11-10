@@ -37,14 +37,16 @@ swiftc "${SWIFT_FLAGS[@]}" -swift-version 5 -Onone -parse-as-library Sources/Mea
 .build/measurement-tests
 swiftc "${SWIFT_FLAGS[@]}" -swift-version 5 -Onone -parse-as-library Sources/Diagnostic.swift Tests/DiagnosticTests.swift -o .build/diagnostic-tests
 .build/diagnostic-tests
+swiftc "${SWIFT_FLAGS[@]}" -swift-version 5 -O -parse-as-library Sources/Parakeet.swift Tests/ParakeetTests.swift -o .build/parakeet-tests
+.build/parakeet-tests
 python3 -I -m unittest discover -s Tests -p 'test_*.py' -q
 if [[ -f Sources/Benchmark.swift ]]; then
-swiftc "${SWIFT_FLAGS[@]}" -swift-version 5 -O -parse-as-library -import-objc-header Sources/WhisperBridge.h Sources/Benchmark.swift .build/WhisperBridge.o "${LIBS[@]}" "${FRAMEWORKS[@]}" -framework AVFoundation -lc++ -o .build/jarvis-benchmark
+swiftc "${SWIFT_FLAGS[@]}" -swift-version 5 -O -parse-as-library -import-objc-header Sources/WhisperBridge.h Sources/Benchmark.swift Sources/Parakeet.swift .build/WhisperBridge.o "${LIBS[@]}" "${FRAMEWORKS[@]}" -framework AVFoundation -lc++ -o .build/jarvis-benchmark
 fi
 if [[ -f Sources/App.swift ]]; then
 APP="$ROOT/dist/Jarvis Voice Lab.app"
 mkdir -p "$APP/Contents/MacOS"
-swiftc "${SWIFT_FLAGS[@]}" -swift-version 5 -O -parse-as-library -import-objc-header Sources/WhisperBridge.h Sources/App.swift Sources/Audio.swift Sources/Measurement.swift Sources/Diagnostic.swift .build/WhisperBridge.o "${LIBS[@]}" "${FRAMEWORKS[@]}" -framework AppKit -framework AVFoundation -framework Carbon -lc++ -o "$APP/Contents/MacOS/JarvisVoiceLab"
+swiftc "${SWIFT_FLAGS[@]}" -swift-version 5 -O -parse-as-library -import-objc-header Sources/WhisperBridge.h Sources/App.swift Sources/Audio.swift Sources/Measurement.swift Sources/Diagnostic.swift Sources/Parakeet.swift .build/WhisperBridge.o "${LIBS[@]}" "${FRAMEWORKS[@]}" -framework AppKit -framework AVFoundation -framework Carbon -lc++ -o "$APP/Contents/MacOS/JarvisVoiceLab"
 python3 - "$APP/Contents/Info.plist" "$ROOT" <<'PY'
 import plistlib,sys
 with open(sys.argv[1],'wb') as f:
@@ -52,6 +54,7 @@ with open(sys.argv[1],'wb') as f:
 PY
 mkdir -p "$APP/Contents/Resources"
 cp "$W/LICENSE" "$APP/Contents/Resources/whisper-LICENSE"
+cp THIRD_PARTY.md "$APP/Contents/Resources/THIRD_PARTY.md"
 codesign --force --sign - "$APP"
 codesign --verify --strict "$APP"
 fi

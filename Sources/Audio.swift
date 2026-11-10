@@ -44,13 +44,14 @@ final class AudioCapture {
     private var active = false
     private var generation = 0
     private var samples: [Float] = []
-    private let maximumSamples = 16_000 * 30
+    private var maximumSamples = 16_000 * 30
     var onLimit: (() -> Void)?
     var onFailure: ((Error) -> Void)?
 
-    func start() throws {
+    func start(maximumSeconds: Int = 30) throws {
         precondition(Thread.isMainThread)
         guard engine == nil else { return }
+        maximumSamples = 16_000 * max(1,min(30,maximumSeconds))
         let newEngine = AVAudioEngine()
         let input = newEngine.inputNode
         let inputFormat = input.outputFormat(forBus: 0)

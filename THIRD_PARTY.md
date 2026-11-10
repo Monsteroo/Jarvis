@@ -1,0 +1,5 @@
+# Third-party attribution
+
+- whisper.cpp v1.8.3, ggml authors: MIT. Source and license: https://github.com/ggml-org/whisper.cpp/tree/v1.8.3. The bundle includes whisper-LICENSE.
+- Ukrainian Parakeet model: Yuri Ihnatov, `ihnatov-yuri/parakeet-tdt-0.6b-v3-uk`, revision `5c4bcfaca501587beaedfd23b72a678bf7194de1`, derived from NVIDIA Parakeet TDT v3. CC BY 4.0: https://creativecommons.org/licenses/by/4.0/. Model card: https://huggingface.co/ihnatov-yuri/parakeet-tdt-0.6b-v3-uk. Model weights are unchanged, loaded from the author's compiled int8 Core ML artifacts. Jarvis adds a selected UK/EN alphabet filter and its own native integration.
+- TDT decoder stepping was adapted with reference to FluidAudio, Apache-2.0: https://github.com/FluidInference/FluidAudio/tree/a31f151. Copyright FluidInference contributors. License: https://www.apache.org/licenses/LICENSE-2.0. Jarvis uses a separate minimal direct Core ML implementation, not the FluidAudio package. Changes include explicit UK/EN token filtering, a bounded decoder, cancellation checks and a 15-second input limit.

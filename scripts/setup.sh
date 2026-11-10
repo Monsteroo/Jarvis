@@ -19,4 +19,5 @@ for model in base small; do
     mv "$target.part" "$target"
   fi
 done
+python3 scripts/parakeet_probe_download.py
 scripts/build.sh
