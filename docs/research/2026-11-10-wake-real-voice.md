@@ -120,6 +120,32 @@ Known limit: two commands with almost no pause between them merge into one segme
 
 Live, 10 November 2026: 6/6 phrases reached a command (4 by screening, 2 by the spotter first). Warm screening ASR took 0.36–0.48 s; the first cold run took 3.5 s. The user confirmed: «Тепер працює».
 
+## Follow-up 3: acknowledgment cue, cold start, continuous speech
+
+**Acknowledgment cue.** A 0.16 s two-tone cue (G6 → C7, sin² envelope) is synthesised in memory and played when a command starts. It can be switched off in «Діагностика». The cue was mixed into recorded commands at offsets of 0.3 and 0.9 s, at up to 0.9× the speech peak:
+- 2 synthetic English commands were unchanged;
+- 4 of the user's commands: 3 were unchanged. In one, a cue overlapping the keyword itself changed «Джаррі» to «Джарю», which is still matched as the keyword.
+
+In the app the cue plays only after the keyword was recognised, so it does not overlap the keyword.
+
+**Cold first recognition.** The earlier warm-up used silence. Parakeet's energy check returns early on silence, so the models never ran. With pages evicted, the first real pass took 5.7 s and the second 1.8 s (synthetic 3.4 s command, one process). The app now runs one throwaway pass on a quiet 1 s tone right after the model loads. In the app that pass took 4.2 s at launch. The user then tested live: the first command after launch was recognised with ASR 0.32 s.
+
+**Continuous speech near the mic (live, built-in speakers at full volume, activation on).** Measured with `say`: Lesya (uk) and Samantha (en), news-style text with similar words such as «Ярослава», «Гарвард», «Джексон», Harvard, Harvey, Travis.
+
+| Condition | Jarvis CPU (one core) | False activations |
+|---|---|---|
+| Quiet room, 20 s | ≈13 % | — |
+| Continuous speech, 93 s | ≈16 % | 0 |
+
+Resident memory was 1.3 GB with Parakeet loaded on CPU.
+
+The app had no trace during this run, so the same audio was replayed offline through `UtteranceSegmenter` and Parakeet:
+- continuous synthetic speech closes segments only at the 12 s limit, giving 5 segments for 56 s;
+- 0/5 segments matched the keyword;
+- warm screening took 3.4 s CPU in total, ≈6 % of one core.
+
+Known limit: a keyword said in the middle of a long screened segment is not a command for screening, because only the first three words count. The keyword spotter is still the fallback for that case.
+
 Not measured yet:
-- CPU while people talk continuously near the mic (TV, conversation);
-- false activations from background media over a longer period.
+- real TV or video audio over a longer period;
+- several speakers in the room.
