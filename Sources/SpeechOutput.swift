@@ -73,6 +73,12 @@ final class SpeechOutput: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDe
     private static let cloudPause: TimeInterval = 15 * 60
     private var cloudPauseReason = ""
 
+    /// Short stock phrases («Хвилинку, сер.») are kept in memory once spoken,
+    /// so they play instantly and cost no credits next time. Never written
+    /// to disk; gone when the app quits.
+    private var phraseCache: [String: Data] = [:]
+    private static let phraseLength = 40
+
     /// A new key or voice resumes cloud attempts at once.
     func resetCloudPause() { cloudPausedUntil = 0 }
 
@@ -106,6 +112,14 @@ final class SpeechOutput: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDe
             onCloudResult?("неправильний ID голосу ElevenLabs", 0, 0)
             return speakLocal(text, voiceID: localVoiceID)
         }
+        let cacheKey = cloud.voiceID + "|" + language + "|" + text
+        if let audio = phraseCache[cacheKey], let player = try? AVAudioPlayer(data: audio) {
+            player.delegate = self
+            self.player = player
+            player.play()
+            onCloudResult?(nil, 0, 0)
+            return true
+        }
         ledger.record(count, at: Date())   // counted when sent; refunded if it fails
         ledger.save()
         let ticket = generation
@@ -120,6 +134,7 @@ final class SpeechOutput: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDe
                     player.delegate = self
                     self.player = player
                     player.play()
+                    if count <= Self.phraseLength, self.phraseCache.count < 16 { self.phraseCache[cacheKey] = data }
                     self.onCloudResult?(nil, count, elapsed)
                     return
                 }

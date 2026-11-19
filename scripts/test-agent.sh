@@ -27,7 +27,9 @@ for TEST in Tests/Agent/*Tests.swift; do
   NAME="$(basename "$TEST" .swift)"
   if [[ -n "${1:-}" && "$NAME" != "$1" ]]; then continue; fi
   MATCHED=$((MATCHED + 1))
-  swiftc "${FLAGS[@]}" -parse-as-library Sources/Actions/*.swift Sources/Agent/*.swift "$TEST" -framework AppKit -framework ApplicationServices -framework CoreAudio -o ".build/agent/$NAME"
+  UI_FILES=()
+  if [[ "$NAME" == "ApprovalControllerTests" ]]; then UI_FILES=(Sources/Actions/UI/*.swift); fi
+  swiftc "${FLAGS[@]}" -parse-as-library Sources/Actions/*.swift Sources/Agent/*.swift ${UI_FILES[@]+"${UI_FILES[@]}"} "$TEST" -framework AppKit -framework SwiftUI -framework ApplicationServices -framework CoreAudio -o ".build/agent/$NAME"
   ".build/agent/$NAME"
 done
 

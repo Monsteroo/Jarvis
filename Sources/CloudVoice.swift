@@ -5,6 +5,7 @@ import Security
 /// (or sets an environment variable); it is never logged or shown again.
 enum KeychainSecret {
     static let elevenLabs = "local.jarvis.voicelab.elevenlabs"
+    static let openAI = "local.jarvis.voicelab.openai"
 
     static func read(_ service: String) -> String? {
         let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service,

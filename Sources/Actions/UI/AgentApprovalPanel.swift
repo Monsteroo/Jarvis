@@ -9,18 +9,25 @@ import SwiftUI
     let language: String
     private let broker: AgentActionBroker
     private let turn: UUID
+    private let onEnd: () -> Void
+    private var endNotified = false
     private let onOutcome: (AgentActionPlan, CommandOutcome) -> Void
     private var valid = true
     private var panel: AgentReviewPanel?
     private var jobs: [UUID: Task<Void, Never>] = [:]
     init(broker: AgentActionBroker, turn: UUID, language: String,
-         onOutcome: @escaping (AgentActionPlan, CommandOutcome) -> Void = { _, _ in }) {
-        self.broker = broker; self.turn = turn; self.language = language == "en" ? "en" : "uk"; self.onOutcome = onOutcome
+         onEnd: @escaping () -> Void = {}, onOutcome: @escaping (AgentActionPlan, CommandOutcome) -> Void = { _, _ in }) {
+        self.broker = broker; self.turn = turn; self.language = language == "en" ? "en" : "uk"; self.onOutcome = onOutcome; self.onEnd = onEnd
+    }
+    func refresh() async {
+        let pending = await broker.pendingPlans().filter { $0.turn == turn }
+        guard valid, !Task.isCancelled else { return }
+        plans = pending
     }
     func show() async {
-        let pending = await broker.pendingPlans().filter { $0.turn == turn }
-        guard valid, !pending.isEmpty, !Task.isCancelled else { return }
-        plans = pending
+        await refresh()
+        guard valid, !Task.isCancelled else { return }
+        guard !plans.isEmpty else { notifyEnd(); return }
         if panel == nil {
             let window = AgentReviewPanel(contentRect: NSRect(x: 0, y: 0, width: 620, height: 430),
                                           styleMask: [.titled, .closable, .nonactivatingPanel, .fullSizeContentView], backing: .buffered, defer: false)
@@ -55,12 +62,22 @@ import SwiftUI
                 if self.valid { self.results[plan.id] = actionText(self.language, "План скасовано або термін підтвердження минув.", "The plan was cancelled or its approval expired.") }
             }
             self.working.remove(plan.id); self.jobs.removeValue(forKey: plan.id)
+            self.finishIfSettled()
         }
     }
     func reject(_ plan: AgentActionPlan) {
         guard valid, plan.turn == turn, !working.contains(plan.id) else { return }
         results[plan.id] = actionText(language, "Відхилено.", "Rejected.")
         Task { await broker.reject(plan: plan.id) }
+        finishIfSettled()
+    }
+    private func finishIfSettled() {
+        guard valid, !plans.isEmpty, working.isEmpty, plans.allSatisfy({ results[$0.id] != nil }) else { return }
+        notifyEnd()
+    }
+    private func notifyEnd() {
+        guard !endNotified else { return }
+        endNotified = true; onEnd()
     }
     func dismiss() {
         invalidate(); panel?.contentView = nil; panel?.close(); panel = nil
@@ -72,6 +89,7 @@ import SwiftUI
         guard valid else { return }; valid = false
         for job in jobs.values { job.cancel() }; jobs.removeAll()
         Task { [broker, turn] in await broker.cancel(turn: turn) }
+        notifyEnd()
     }
     func description(_ action: Action) -> String {
         func literal(_ value: String) -> String {

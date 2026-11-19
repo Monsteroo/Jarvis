@@ -190,11 +190,11 @@ final class JarvisApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Parakeet screening of speech segments while wake is armed (user
     /// decision, 10 Nov 2026). One in flight, at most one pending (the newest).
     private struct Segment { let samples: [Float]; let end: Int; let epoch: Int; let heardAt: Double }
-    private var screenToken = 0
-    private var screenBusy = false
-    private var screenPending: Segment?
+    private var screening = WakeScreeningQueue<Segment>()
+    private var wakeActivationRequest: UUID?
     private enum RecordSource { case ptt, wake }
     private var source: RecordSource = .ptt
+    private var wakePrefixConfirmed = false
     /// Wake monitoring was running before sleep / session switch.
     private var resumeWakeOnWake = false
     private var gate = CaptureGate()
@@ -234,9 +234,13 @@ final class JarvisApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             previewVoice: { [weak self] in self?.previewVoice($0) },
             saveCloudKey: { [weak self] in self?.saveCloudKey($0) },
             deleteCloudKey: { [weak self] in self?.deleteCloudKey() },
+            saveOpenAIKey: { [weak self] in self?.saveOpenAIKey($0) },
+            deleteOpenAIKey: { [weak self] in self?.deleteOpenAIKey() },
             openMicrophoneSettings: {
                 NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone")!)
-            })
+            },
+            revealConversations: { [weak self] in self?.revealConversations() },
+            clearConversations: { [weak self] in self?.clearConversations() })
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -252,6 +256,12 @@ final class JarvisApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         store.hasCloudKey = ProcessInfo.processInfo.environment["ELEVENLABS_API_KEY"] != nil
             || KeychainSecret.read(KeychainSecret.elevenLabs) != nil
         store.refreshCloudUsage()
+        store.hasOpenAIKey = ProcessInfo.processInfo.environment["OPENAI_API_KEY"] != nil
+            || KeychainSecret.read(KeychainSecret.openAI) != nil
+        store.agentRuntimeReady = FileManager.default.isExecutableFile(atPath: gooseExecutable.path)
+            && FileManager.default.isExecutableFile(atPath: helperExecutable.path)
+        if store.hasOpenAIKey, let parts = try? agentComponents() { agentParts = parts; refreshAgentBudget() }
+        conversationLog.prune()
         store.loadVoices()
         audio.onLimit = { [weak self] in self?.finishRecording(timedOut: true) }
         audio.onFailure = { [weak self] error in
@@ -315,9 +325,26 @@ final class JarvisApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         wakeTrace("focus field=\(dictationToken != nil)") // a flag only, no app names or text
     }
 
+    private func refreshEscape() {
+        if store.canCancel { enableEscape() } else { disableEscape() }
+    }
+    private func beginRequest(turn id: Int, phase: RequestActivity.Phase) {
+        store.requestActivity.begin(turn: id, phase: phase)
+        refreshEscape()
+        showHUD()
+    }
+    private func finishRequest(turn id: Int) {
+        store.requestActivity.finish(turn: id)
+        refreshEscape()
+        if !store.canCancel { hideHUD(after: 3.5) }
+    }
+
     private func cancelCommand() {
         commandTask?.cancel()
         commandTask = nil
+        cancelAgent()
+        store.requestActivity.cancel()
+        refreshEscape()
     }
 
     /// Runs a recognised command through the typed executor and reports the
@@ -325,8 +352,11 @@ final class JarvisApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func runCommand(_ text: String, turn id: Int, language: String) {
         cancelCommand()
         guard !text.isEmpty else { return }
+        beginRequest(turn: id, phase: .command)
         let token = dictationToken
         dictationToken = nil
+        lastCommandText = text
+        lastCommandTurn = id
         store.stages.action = .active
         store.stages.actionNote = nil
         let executor = self.executor
@@ -335,11 +365,216 @@ final class JarvisApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let outcome = await executor.handle(text, language: language, dictationToken: token)
             guard let self, !Task.isCancelled, self.store.machine.turn == id, !self.store.machine.busy else { return }
             self.commandTask = nil
-            self.present(outcome, language: language, seconds: ProcessInfo.processInfo.systemUptime - started)
+            self.present(outcome, turn: id, language: language, seconds: ProcessInfo.processInfo.systemUptime - started)
         }
     }
 
-    private func present(_ outcome: CommandOutcome, language: String, seconds: Double) {
+    private var lastCommandText = ""
+    private var lastCommandTurn = 0
+
+    // MARK: AI agent (Goose + OpenAI; any action needs native one-time approval)
+
+    private var appSupport: URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("Jarvis")
+    }
+    /// Both executables come from this app bundle only, never from settings or the model.
+    private var gooseExecutable: URL { Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers/goose-acp") }
+    private var helperExecutable: URL { Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers/JarvisMCPHelper") }
+    private var agentParts: (agent: BudgetedGooseAgent, broker: AgentActionBroker, ledger: BudgetLedger, model: String)?
+    private var agentTask: Task<Void, Never>?
+    private var approval: AgentApprovalController?
+    private var cachedOpenAIKey: String?
+
+    private func openAIKey() -> String? {
+        if cachedOpenAIKey == nil {
+            cachedOpenAIKey = ProcessInfo.processInfo.environment["OPENAI_API_KEY"] ?? KeychainSecret.read(KeychainSecret.openAI)
+        }
+        return cachedOpenAIKey.flatMap { $0.isEmpty ? nil : $0 }
+    }
+
+    private var agentAvailable: Bool {
+        store.agentEnabled && FileManager.default.isExecutableFile(atPath: gooseExecutable.path)
+            && FileManager.default.isExecutableFile(atPath: helperExecutable.path) && openAIKey() != nil
+    }
+
+    /// One broker/ledger/agent for the app; rebuilt only when the model changes.
+    private func agentComponents() throws -> (agent: BudgetedGooseAgent, broker: AgentActionBroker, ledger: BudgetLedger, model: String) {
+        if let parts = agentParts, parts.model == store.agentModel { return parts }
+        let runner = MainActor.assumeIsolated { LocalTypedActionRunner(executor) }
+        let broker = agentParts?.broker ?? AgentActionBroker(executor: runner)
+        let ledger = try agentParts?.ledger ?? BudgetLedger(file: appSupport.appendingPathComponent("budget.json"))
+        let config = try GooseConfig.openAI(root: appSupport.appendingPathComponent("goose"), model: store.agentModel)
+        let agent = BudgetedGooseAgent(config: config, ledger: ledger, launcher: TimedGooseLauncher(inner: PinnedGooseLauncher(executable: gooseExecutable), probe: agentProbe))
+        let parts = (agent: agent, broker: broker, ledger: ledger, model: store.agentModel)
+        agentParts = parts
+        return parts
+    }
+
+    private func cancelAgent() {
+        agentTask?.cancel()
+        agentTask = nil
+        if let approval { MainActor.assumeIsolated { approval.dismiss() } } // also cancels the broker turn
+        approval = nil
+    }
+
+    private var acknowledgmentIndex = Int.random(in: 0..<4)
+    private let agentProbe = AgentTimingProbe()
+
+    // MARK: Conversation log (local text, for reviewing mistakes and latency)
+
+    private lazy var conversationLog = ConversationLog(directory: appSupport.appendingPathComponent("conversations"),
+                                                       enabled: store.conversationLog)
+
+    private func logEvent(_ event: String, _ fields: [String: Any] = [:]) {
+        conversationLog.enabled = store.conversationLog
+        conversationLog.record(event, fields)
+    }
+
+    private func revealConversations() {
+        let directory = conversationLog.directory
+        if let latest = ConversationLog.files(in: directory).last {
+            NSWorkspace.shared.activateFileViewerSelecting([latest])
+        } else {
+            store.conversationLogStatus = "Журнал поки порожній."
+        }
+    }
+
+    private func clearConversations() {
+        conversationLog.clear()
+        store.conversationLogStatus = "Журнал очищено."
+    }
+
+    private static func rounded(_ value: Double?) -> Any {
+        value.map { ($0 * 100).rounded() / 100 } ?? NSNull()
+    }
+
+    private func runAgent(_ text: String, turn id: Int, language: String) {
+        cancelAgent()
+        let en = language == "en"
+        guard let key = openAIKey(), let parts = try? agentComponents() else {
+            finishRequest(turn: id)
+            store.stages.action = .failed
+            store.actionMessage = en ? "The AI agent is not configured." : "Розумний агент не налаштований."
+            return
+        }
+        beginRequest(turn: id, phase: .agent)
+        let voiceTurn = UUID()
+        store.stages.action = .active
+        store.stages.actionNote = "AI"
+        store.actionMessage = en ? "Thinking…" : "Думаю…"
+        let context = AgentPlanningContext(broker: parts.broker, turn: voiceTurn, helperExecutable: helperExecutable)
+        let started = ProcessInfo.processInfo.systemUptime
+        // The first answer takes seconds: Jarvis acknowledges at once, in character.
+        let acknowledged = store.spokenReplies
+        if acknowledged {
+            acknowledgmentIndex += 1
+            speak(AgentPersona.acknowledgment(language: language, index: acknowledgmentIndex), language: language)
+        }
+        let request = AgentPersona.prompt(for: text, language: language, acknowledged: acknowledged)
+        wakeTrace("agent start persona v\(AgentPersona.version)")
+        logEvent("agent_start", ["request": text, "model": store.agentModel, "persona": AgentPersona.version, "language": language])
+        let probe = agentProbe
+        agentTask = Task { @MainActor [weak self] in
+            await probe.begin()
+            do {
+                let answer = try await parts.agent.run(text: request, language: language, apiKey: key, planning: context)
+                guard let self, !Task.isCancelled, self.store.machine.turn == id else { return }
+                let reply = answer.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                let seconds = ProcessInfo.processInfo.systemUptime - started
+                self.store.stages.action = .done
+                self.store.stages.actionNote = answer.cost.map { String(format: "AI %.1f с · $%.4f", seconds, Double($0.micros) / 1_000_000) }
+                    ?? String(format: "AI %.1f с", seconds)
+                self.store.actionMessage = reply.isEmpty ? (en ? "No text answer." : "Відповіді текстом немає.") : String(reply.prefix(600))
+                self.wakeTrace(String(format: "agent ok %.1f s chars=%d", seconds, reply.count))
+                let timing = await probe.snapshot()
+                self.logEvent("agent", ["reply": reply, "seconds": Self.rounded(seconds), "launch_s": Self.rounded(timing.launch),
+                                        "first_text_s": Self.rounded(timing.firstText), "model_rounds": timing.rounds,
+                                        "proposals": timing.proposals, "stop": answer.stopReason,
+                                        "cost_usd": answer.cost.map { Double($0.micros) / 1_000_000 } ?? NSNull()])
+                self.refreshAgentBudget()
+                let plans = await parts.broker.pendingPlans()
+                guard !Task.isCancelled, self.store.machine.turn == id, self.store.requestActivity.turn == id else { return }
+                if plans.isEmpty {
+                    self.finishRequest(turn: id)
+                } else {
+                    self.beginRequest(turn: id, phase: .approval)
+                    let controller = AgentApprovalController(broker: parts.broker, turn: voiceTurn, language: language,
+                        onEnd: { [weak self] in self?.finishRequest(turn: id) }) { [weak self] _, outcome in
+                        self?.agentPlanFinished(outcome, language: language)
+                    }
+                    self.approval = controller
+                    await controller.show()
+                }
+                guard !Task.isCancelled, self.store.machine.turn == id else { return }
+                self.agentTask = nil
+                if !reply.isEmpty { self.speakAfterCurrent(AgentPersona.spokenPart(reply), language: language) }
+            } catch {
+                guard let self, !Task.isCancelled, self.store.machine.turn == id else { return }
+                self.agentTask = nil
+                self.finishRequest(turn: id)
+                self.store.stages.action = .failed
+                self.store.stages.actionNote = "AI"
+                self.store.actionMessage = Self.agentFailure(error, language: language)
+                self.wakeTrace("agent failed \(error)")
+                let timing = await probe.snapshot()
+                self.logEvent("agent_error", ["error": "\(error)", "seconds": Self.rounded(ProcessInfo.processInfo.systemUptime - started),
+                                              "launch_s": Self.rounded(timing.launch), "first_text_s": Self.rounded(timing.firstText)])
+                self.refreshAgentBudget()
+                self.speakAfterCurrent(en ? "My apologies, sir, the request failed." : "Перепрошую, сер, не вдалося отримати відповідь.", language: language)
+            }
+        }
+    }
+
+    private func agentPlanFinished(_ outcome: CommandOutcome, language: String) {
+        logEvent("plan", ["outcome": "\(outcome)"])
+        switch outcome {
+        case .done(let summary): store.actionMessage = summary; speak(summary, language: language)
+        case .partial(let summary, let details): store.actionMessage = summary + " " + details; speak(summary, language: language)
+        case .failed(let reason): store.actionMessage = reason; speak(reason, language: language)
+        default: break
+        }
+    }
+
+    static func agentFailure(_ error: Error, language: String) -> String {
+        let en = language == "en"
+        switch error {
+        case BudgetError.exhausted: return en ? "The monthly AI budget ($10) is used up." : "Місячний бюджет AI ($10) вичерпано."
+        case AgentError.busy: return en ? "The previous AI request is still finishing." : "Попередній запит AI ще завершується."
+        case AgentError.timeout: return en ? "The AI did not answer in time." : "AI не відповів вчасно."
+        case AgentError.invalidConfiguration: return en ? "AI setup is invalid: check the bundled runtime and model name." : "Налаштування AI некоректні: перевірте модель і вбудований Goose."
+        case AgentError.provider(let code): return en ? "The AI returned an error (\(code)). Check the OpenAI key, model and balance." : "AI повернув помилку (\(code)). Перевірте ключ OpenAI, модель і баланс."
+        default: return en ? "The AI request failed." : "Не вдалося отримати відповідь AI."
+        }
+    }
+
+    private func refreshAgentBudget() {
+        guard let ledger = agentParts?.ledger else { return }
+        Task { @MainActor [weak self] in
+            guard let snapshot = try? await ledger.snapshot() else { return }
+            self?.store.agentBudget = String(format: "Цього місяця: $%.2f з $%.0f", Double(snapshot.committed.micros) / 1_000_000, Double(snapshot.limit.micros) / 1_000_000)
+        }
+    }
+
+    private func saveOpenAIKey(_ key: String) {
+        let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        if KeychainSecret.save(trimmed, KeychainSecret.openAI) {
+            cachedOpenAIKey = trimmed
+            store.hasOpenAIKey = true
+            store.agentStatus = "Ключ OpenAI збережено в Keychain."
+        } else {
+            store.agentStatus = "Не вдалося зберегти ключ у Keychain."
+        }
+    }
+
+    private func deleteOpenAIKey() {
+        KeychainSecret.delete(KeychainSecret.openAI)
+        cachedOpenAIKey = nil
+        store.hasOpenAIKey = ProcessInfo.processInfo.environment["OPENAI_API_KEY"] != nil
+        store.agentStatus = "Ключ OpenAI видалено з Keychain."
+    }
+
+    private func present(_ outcome: CommandOutcome, turn id: Int, language: String, seconds: Double) {
         let en = language == "en"
         let spoken: String
         switch outcome {
@@ -364,6 +599,10 @@ final class JarvisApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             store.stages.actionNote = en ? "needs approval" : "потрібне підтвердження"
             store.actionMessage = en ? "This action needs confirmation, which is not connected yet." : "Ця дія потребує підтвердження, яке ще не підключено."
             spoken = store.actionMessage
+        case .notUnderstood where agentAvailable:
+            logEvent("action", ["result": "notUnderstood", "next": "agent", "seconds": Self.rounded(seconds)])
+            runAgent(lastCommandText, turn: lastCommandTurn, language: language)
+            return
         case .notUnderstood:
             store.stages.action = .failed
             store.stages.actionNote = en ? "not understood" : "не зрозумів"
@@ -372,6 +611,8 @@ final class JarvisApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             spoken = en ? "I don't know this command yet." : "Поки не знаю такої команди."
         }
         wakeTrace(String(format: "action %@ %.2f s", "\(outcome)".prefix(12).description, seconds))
+        logEvent("action", ["result": "\(outcome)", "message": store.actionMessage, "seconds": Self.rounded(seconds)])
+        finishRequest(turn: id)
         speak(spoken, language: language)
     }
 
@@ -458,7 +699,7 @@ final class JarvisApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         hudHide?.invalidate()
         guard hud.isVisible else { return }
         hudHide = Timer.scheduledTimer(withTimeInterval: seconds, repeats: false) { [weak self] _ in
-            guard let self, !self.store.machine.busy else { return }
+            guard let self, !self.store.canCancel else { return }
             self.hud.orderOut(nil)
             self.store.hudVisible = false
             self.hudHide = nil
@@ -503,7 +744,7 @@ final class JarvisApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(menuItem("Показати Jarvis", #selector(showMainWindow)))
         menu.addItem(menuItem(store.machine.microphoneEnabled ? "Вимкнути мікрофон" : "Увімкнути мікрофон", #selector(toggleMicrophoneFromMenu)))
         let cancel = menuItem("Скасувати поточний запит", #selector(cancelFromMenu))
-        cancel.isEnabled = store.machine.busy
+        cancel.isEnabled = store.canCancel
         menu.addItem(cancel)
         menu.addItem(.separator())
         menu.addItem(menuItem("Завершити Jarvis", #selector(quit)))
@@ -525,6 +766,7 @@ final class JarvisApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func quit() { NSApp.terminate(nil) }
 
     private func stateChanged(_ machine: VoiceMachine) {
+        refreshEscape()
         updateStatusIcon()
         // The detector listens only while idle with activation enabled; a
         // wake-started command switches it to endpointing by itself.
@@ -533,6 +775,7 @@ final class JarvisApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } else if !(machine.busy && source == .wake) {
             wake.setMode(.off)
         }
+        if store.requestActivity.active { showHUD(); return }
         switch machine.phase {
         case .recording, .transcribing, .speaking: showHUD()
         case .microphoneOff: hideHUD(after: 1.2)
@@ -555,11 +798,13 @@ final class JarvisApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func setLanguage(_ index: Int) {
         guard !store.machine.busy, store.languageTitles.indices.contains(index) else { return }
+        screening.invalidate()
         store.languageIndex = index
         refreshMeasurement()
     }
 
     private func loadSelectedModel() {
+        screening.invalidate()
         store.machine.modelLoading()
         store.recordLimit = recordingLimit
         refreshMeasurement()
@@ -590,7 +835,7 @@ final class JarvisApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let pressed = GetEventKind(event) == UInt32(kEventHotKeyPressed)
             if identifier.id == 1 { pressed ? app.keyDown() : app.keyUp() }
             if (identifier.id == 2 || identifier.id == 3) && pressed {
-                if app.store.machine.speaking { app.stopSpeaking() } else { app.cancelSession(message: "Скасовано. Запис зупинено, результат відкинуто.") }
+                if app.store.machine.speaking && !app.store.requestActivity.active { app.stopSpeaking() } else { app.cancelSession(message: "Скасовано. Запис зупинено, результат відкинуто.") }
             }
             return noErr
         }, events.count, &events, Unmanaged.passUnretained(self).toOpaque(), &eventHandler)
@@ -609,6 +854,7 @@ final class JarvisApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func disableEscape() {
+        guard !store.canCancel else { enableEscape(); return }
         if let escapeKey { UnregisterEventHotKey(escapeKey) }
         escapeKey = nil
         if let escapeChord { UnregisterEventHotKey(escapeChord) }
@@ -674,8 +920,7 @@ final class JarvisApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         cancelCommand()
         store.actionMessage = ""
         captureFocus()
-        screenToken += 1   // a pending screening result must not start a second turn
-        screenPending = nil
+        screening.invalidate() // old screening results cannot create another turn
         turn = id
         started = ProcessInfo.processInfo.systemUptime
         store.recordElapsed = 0
@@ -745,19 +990,27 @@ final class JarvisApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let measured = store.measuring && !wasDiagnostic ? currentPrompt() : nil
         let measuredModel = modelName
         let fromWake = source == .wake
+        let prefixConfirmed = wakePrefixConfirmed
         speech.transcribe(samples, language: code) { [weak self] raw, elapsed in
-            guard let self else { return }
+            guard let self, self.turn == id, self.store.machine.phase == .transcribing else { return }
             var text = raw
             if fromWake, let heard = raw {
-                let stripped = WakeText.stripLeadingWakeWord(heard)
-                text = stripped.text
-                self.wakeTrace(String(format: "asr done %.2f s, chars=%d, keyword=%@, command chars=%d",
-                                      elapsed, heard.count, stripped.found ? "yes" : "no", stripped.text.count))
-                if stripped.text.isEmpty, self.store.machine.phase == .transcribing, self.turn == id {
+                guard let command = WakeText.command(from: heard, prefixConfirmed: prefixConfirmed) else {
+                    // A KWS hint is not permission to execute a background mention.
                     self.turn = nil
+                    self.store.stages = TurnStages()
+                    self.store.machine.abandon(turn: id, message: "")
                     self.disableEscape()
+                    return
+                }
+                text = command
+                self.wakeTrace(String(format: "asr done %.2f s, chars=%d, prefixConfirmed=%@, command chars=%d",
+                                      elapsed, heard.count, prefixConfirmed ? "yes" : "no", command.count))
+                if command.isEmpty {
+                    self.turn = nil
                     self.store.stages = TurnStages()
                     self.store.machine.abandon(turn: id, message: "Не почув команди після «Jarvis». Скажіть ще раз.")
+                    self.disableEscape()
                     return
                 }
             }
@@ -766,6 +1019,11 @@ final class JarvisApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             // Shown and passed on in clean Ukrainian; measurements keep the raw ASR text.
             let shown = text.map { TranscriptCleanup.normalize($0, language: code) }
             guard self.store.machine.finishTranscription(turn: id, text: shown) else { return }
+            if measured == nil, !wasDiagnostic {
+                self.conversationLog.beginTurn(id, at: releasedAt)
+                self.logEvent("heard", ["source": fromWake ? "wake" : "ptt", "language": code, "raw": raw ?? NSNull(),
+                                        "shown": shown ?? NSNull(), "audio_s": Self.rounded(duration), "asr_s": Self.rounded(elapsed)])
+            }
             let responseTime = ProcessInfo.processInfo.systemUptime - releasedAt
             self.turn = nil
             self.disableEscape()
@@ -791,6 +1049,10 @@ final class JarvisApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func cancelSession(message: String) {
+        wakeActivationRequest = nil
+        store.wakeLoading = false
+        store.pendingWake = false
+        screening.invalidate()
         cancelCommand()
         MainActor.assumeIsolated { executor.invalidateDictationTarget() }
         dictationToken = nil
@@ -811,6 +1073,7 @@ final class JarvisApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         turn = nil
         if store.stages.record == .active || store.stages.recognize == .active { store.stages = TurnStages() }
         store.machine.cancel(message: message)
+        refreshEscape()
     }
 
     // MARK: Spoken replies
@@ -821,9 +1084,11 @@ final class JarvisApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Speaks a short reply with the chosen voice. Wake detection is paused
     /// for the whole reply and a short tail, so Jarvis never hears itself.
     func speak(_ text: String, language: String) {
+        queuedSpeech = nil
         guard store.spokenReplies, !store.machine.busy else { return }
         let voiceID = language == "en" ? store.voiceEN : store.voiceUK
         guard store.machine.beginSpeaking() else { return }
+        logEvent("speak", ["text": text, "language": language])
         speechToken += 1
         enableEscape()
         showHUD()
@@ -834,6 +1099,7 @@ final class JarvisApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func stopSpeaking() {
+        queuedSpeech = nil
         guard store.machine.speaking else { return }
         speechToken += 1
         voice.stop()
@@ -841,7 +1107,22 @@ final class JarvisApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         disableEscape()
     }
 
+    /// A reply that arrived while the acknowledgment was still playing.
+    private var queuedSpeech: (text: String, language: String)?
+
+    /// Lets "Хвилинку, сер" finish before the answer starts.
+    func speakAfterCurrent(_ text: String, language: String) {
+        if store.machine.speaking && voice.isSpeaking { queuedSpeech = (text, language) } else { speak(text, language: language) }
+    }
+
     private func speechEnded() {
+        if let next = queuedSpeech {
+            queuedSpeech = nil
+            speechToken += 1
+            let voiceID = next.language == "en" ? store.voiceEN : store.voiceUK
+            if store.machine.speaking { logEvent("speak", ["text": next.text, "language": next.language, "after_acknowledgment": true]) }
+            if store.machine.speaking, voice.speak(next.text, language: next.language, localVoiceID: voiceID, cloud: cloudPlan()) { return }
+        }
         speechToken += 1
         let token = speechToken
         // Room echo of the last syllable must not reach the detector.
@@ -876,6 +1157,8 @@ final class JarvisApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         store.cloudStatus = reason.map { "Відповів голос macOS: \($0)." }
             ?? String(format: "Відповів ElevenLabs, звук отримано за %.2f с.", seconds)
         wakeTrace(String(format: "cloud tts %@ chars=%d %.2f s", reason == nil ? "ok" : "fallback", characters, seconds))
+        logEvent("voice", ["engine": reason != nil ? "macos" : (characters == 0 ? "elevenlabs-cached" : "elevenlabs"),
+                           "request_s": Self.rounded(seconds), "fallback_reason": reason ?? NSNull()])
     }
 
     private func saveCloudKey(_ key: String) {
@@ -929,11 +1212,15 @@ final class JarvisApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     /// Called after the microphone is enabled for a pending activation request.
     private func continueEnablingWake() {
+        screening.invalidate()
         store.pendingWake = false
         guard store.machine.microphoneEnabled, !store.machine.wakeEnabled else { return }
+        let request = UUID()
+        wakeActivationRequest = request
         store.wakeLoading = true
         wake.load(modelDir: wakeModelDir) { [weak self] ok in
-            guard let self else { return }
+            guard let self, self.wakeActivationRequest == request else { return }
+            self.wakeActivationRequest = nil
             self.store.wakeLoading = false
             guard ok else {
                 self.store.wakeError = "Модель активації не знайдена. Запустіть scripts/setup-wake.sh."
@@ -953,6 +1240,10 @@ final class JarvisApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func disableWake(message: String) {
+        wakeActivationRequest = nil
+        store.wakeLoading = false
+        store.pendingWake = false
+        screening.invalidate()
         if source == .wake && store.machine.busy { cancelSession(message: "") }
         wake.stop()
         audio.stopMonitoring()
@@ -965,26 +1256,29 @@ final class JarvisApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         switch event {
         case .utterance(let samples, let end, let epoch):
             let segment = Segment(samples: samples, end: end, epoch: epoch, heardAt: ProcessInfo.processInfo.systemUptime)
-            if screenBusy { screenPending = segment } else { screen(segment) }
-        case .wake(let generation):
+            screen(segment)
+        case .wake(let generation, let prefixConfirmed):
             // The listener already started the command recording atomically.
             // Accept it only if this is still an idle, armed state.
             wakeTrace("wake gen=\(generation) armed=\(store.machine.wakeArmed) phase=\(store.machine.phase) recGen=\(String(describing: audio.recordingGeneration))")
-            guard store.machine.wakeArmed, audio.recordingGeneration == generation,
-                  let id = store.machine.beginRecording() else {
+            // A queued event from an older capture must not stop a newer one.
+            guard audio.recordingGeneration == generation else { return }
+            guard store.machine.wakeArmed, let id = store.machine.beginRecording() else {
                 wakeTrace("wake rejected")
                 if audio.recordingGeneration == generation { audio.stop() }
                 wake.setMode(.off)
                 if store.machine.wakeArmed { wake.setMode(.armed) }
                 return
             }
+            wakePrefixConfirmed = prefixConfirmed
             source = .wake
             store.keyRecording = false
             beginTurnUI(id)
             acknowledge()
-        case .endpoint(let outcome):
+        case .endpoint(let outcome, let generation):
             wakeTrace("endpoint \(outcome) source=\(source) phase=\(store.machine.phase)")
-            guard source == .wake, store.machine.phase == .recording, turn != nil else { return }
+            guard source == .wake, store.machine.phase == .recording, turn != nil,
+                  audio.recordingGeneration == generation else { return }
             switch outcome {
             case .speechEnded:
                 finishRecording(timedOut: false)
@@ -1004,28 +1298,19 @@ final class JarvisApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func screen(_ segment: Segment) {
-        guard canScreen else { return }
-        screenBusy = true
-        screenToken += 1
-        let token = screenToken
-        speech.screen(segment.samples, language: languageCode) { [weak self] heard, elapsed in
+        guard canScreen, let job = screening.submit(segment) else { return }
+        speech.screen(job.element.samples, language: languageCode) { [weak self] heard, elapsed in
             guard let self else { return }
-            self.screenBusy = false
             defer {
-                if let next = self.screenPending {
-                    self.screenPending = nil
-                    self.screen(next)
-                }
+                if let next = self.screening.finish(job.ticket) { self.screen(next) }
             }
-            guard token == self.screenToken, self.canScreen, let heard else { return }
+            guard self.screening.isCurrent(job.ticket), self.canScreen, let heard else { return }
             let stripped = WakeText.stripLeadingWakeWord(heard)
-            // Counts only: the transcript of non-wake speech is never logged.
             self.wakeTrace(String(format: "screen %.2f s audio, asr %.2f s, keyword=%@, command chars=%d",
                                   Double(segment.samples.count) / 16_000, elapsed,
                                   stripped.found ? "yes" : "no", stripped.found ? stripped.text.count : -1))
             guard stripped.found else { return }
             if stripped.text.isEmpty {
-                // "Джарвіс" alone: the next phrase is the command.
                 self.wake.startCommand(after: segment.end, epoch: segment.epoch)
                 return
             }
@@ -1040,7 +1325,7 @@ final class JarvisApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         store.actionMessage = ""
         captureFocus()
         source = .wake
-        screenPending = nil
+        screening.invalidate()
         store.stages = TurnStages(record: .done, recognize: .done, text: .done,
                                   audioSeconds: Double(segment.samples.count) / 16_000,
                                   asrSeconds: asrSeconds,
@@ -1048,6 +1333,9 @@ final class JarvisApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         store.machine.beginTranscribing(turn: id, timedOut: false)
         let command = TranscriptCleanup.normalize(text, language: languageCode)
         _ = store.machine.finishTranscription(turn: id, text: command)
+        conversationLog.beginTurn(id, at: segment.heardAt)
+        logEvent("heard", ["source": "wake-phrase", "language": languageCode, "raw": text, "shown": command,
+                           "audio_s": Self.rounded(Double(segment.samples.count) / 16_000), "asr_s": Self.rounded(asrSeconds)])
         acknowledge()
         runCommand(command, turn: id, language: languageCode)
     }
@@ -1058,6 +1346,7 @@ final class JarvisApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func restartMonitoring(reason: Error) {
+        screening.invalidate()
         wake.setMode(.off)
         audio.stopMonitoring()
         do {

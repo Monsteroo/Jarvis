@@ -72,6 +72,23 @@ final class VoiceStore: ObservableObject {
     @Published var cloudCharacterLimit = UserDefaults.standard.object(forKey: "cloudCharacterLimit") as? Int ?? 0 {
         didSet { UserDefaults.standard.set(cloudCharacterLimit, forKey: "cloudCharacterLimit") }
     }
+    /// Local text log of conversations (the owner asked for it, to review
+    /// mistakes and latency). Text only, never audio; can be switched off.
+    @Published var conversationLog = UserDefaults.standard.object(forKey: "conversationLog") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(conversationLog, forKey: "conversationLog") }
+    }
+    @Published var conversationLogStatus = ""
+    /// AI agent for requests the simple rules do not understand (opt-out).
+    @Published var agentEnabled = UserDefaults.standard.object(forKey: "agentEnabled") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(agentEnabled, forKey: "agentEnabled") }
+    }
+    @Published var agentModel = UserDefaults.standard.string(forKey: "agentModel") ?? "gpt-5.4-mini" {
+        didSet { UserDefaults.standard.set(agentModel, forKey: "agentModel") }
+    }
+    @Published var hasOpenAIKey = false
+    @Published var agentRuntimeReady = false
+    @Published var agentStatus = ""
+    @Published var agentBudget = ""
     @Published var hasCloudKey = false
     @Published var cloudStatus = ""
     @Published var cloudUsed = 0
@@ -98,6 +115,9 @@ final class VoiceStore: ObservableObject {
     }
     let modelTitles = ["Parakeet UK", "Whisper small", "Whisper base"]
     let languageTitles = ["Українська", "English"]
+
+    @Published var requestActivity = RequestActivity()
+    var canCancel: Bool { requestActivity.canCancel(audioBusy: machine.busy, speaking: machine.speaking) }
 
     var phase: VoicePhase { machine.phase }
     var mode: FilamentMode { FilamentMode(machine.phase, microphoneEnabled: machine.microphoneEnabled) }
@@ -186,7 +206,11 @@ struct VoiceActions {
     var previewVoice: (String) -> Void = { _ in }
     var saveCloudKey: (String) -> Void = { _ in }
     var deleteCloudKey: () -> Void = {}
+    var saveOpenAIKey: (String) -> Void = { _ in }
+    var deleteOpenAIKey: () -> Void = {}
     var openMicrophoneSettings: () -> Void = {}
+    var revealConversations: () -> Void = {}
+    var clearConversations: () -> Void = {}
 }
 
 // MARK: - Shared pieces
@@ -424,7 +448,7 @@ struct AssistantView: View {
             StagesRow(store: store)
             HStack(spacing: 14) {
                 commandField
-                if store.machine.busy {
+                if store.canCancel {
                     Button(action: actions.cancel) {
                         Label("Скасувати", systemImage: "xmark").font(.system(size: 14, weight: .medium))
                             .foregroundStyle(ArcPalette.text).padding(.horizontal, 16).frame(height: 46)
@@ -560,6 +584,18 @@ struct DiagnosticsView: View {
                     }
                     note("Ліміт запису: \(store.recordLimit) с. Parakeet UK — модель за замовчуванням; Whisper — резервні варіанти.")
                 }
+                section("Розумний агент (OpenAI через Goose)") {
+                    AgentSettings(store: store, actions: actions)
+                }
+                section("Журнал розмов") {
+                    Toggle("Записувати розмови локально (текст і час етапів, без аудіо)", isOn: $store.conversationLog)
+                    HStack {
+                        Button("Показати у Finder", action: actions.revealConversations)
+                        Button("Очистити журнал", action: actions.clearConversations)
+                    }
+                    if !store.conversationLogStatus.isEmpty { note(store.conversationLogStatus) }
+                    note("Що ви сказали, що розпізнано, що відповів Jarvis і скільки тривав кожен етап. Лише на цьому Mac, у ~/Library/Application Support/Jarvis/conversations; файли старші за 30 днів видаляються.")
+                }
                 section("Голос відповідей") {
                     Toggle("Відповідати голосом (вимкнено — лише текст)", isOn: $store.spokenReplies)
                     CloudVoiceSettings(store: store, actions: actions)
@@ -651,7 +687,7 @@ struct HUDView: View {
                 .lineLimit(1)
             FilamentField(level: level, mode: store.mode, animate: store.hudVisible && !store.reduceMotion, compact: true)
                 .frame(height: 44)
-            if store.machine.busy {
+            if store.canCancel {
                 Button(action: actions.cancel) {
                     Image(systemName: "xmark").font(.system(size: 13, weight: .semibold))
                         .foregroundStyle(ArcPalette.text)
@@ -712,6 +748,45 @@ struct CloudVoiceSettings: View {
                 Text(store.cloudStatus).font(.system(size: 12)).foregroundStyle(ArcPalette.secondary)
             }
             Text("ElevenLabs отримує лише текст відповіді; звук мікрофона не надсилається. Мова задається явно (uk або en). Будь-яка помилка ElevenLabs (кредити, ключ, мережа, понад 5 с очікування) — і відповідає голос macOS.")
+                .font(.system(size: 12)).foregroundStyle(ArcPalette.secondary).fixedSize(horizontal: false, vertical: true)
+        }
+    }
+}
+
+
+/// OpenAI key into Keychain, model name, monthly budget. Plans from the model
+/// run only after the user presses «Підтвердити один раз» in the plan panel.
+struct AgentSettings: View {
+    @ObservedObject var store: VoiceStore
+    let actions: VoiceActions
+    @State private var key = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Toggle("Передавати агенту команди, яких не розуміють прості правила", isOn: $store.agentEnabled)
+            HStack {
+                Text("Модель")
+                TextField("gpt-5.4-mini", text: $store.agentModel).frame(width: 220).font(.system(size: 12).monospaced())
+            }
+            HStack {
+                if store.hasOpenAIKey {
+                    Text("Ключ OpenAI збережено").foregroundStyle(ArcPalette.secondary)
+                    Button("Видалити ключ", action: actions.deleteOpenAIKey)
+                } else {
+                    SecureField("Ключ API OpenAI", text: $key).frame(width: 260)
+                    Button("Зберегти в Keychain") { actions.saveOpenAIKey(key); key = "" }.disabled(key.isEmpty)
+                }
+            }
+            if !store.agentRuntimeReady {
+                Text("Goose не вбудовано в цю збірку — агент недоступний.").font(.system(size: 12)).foregroundStyle(ArcPalette.amber)
+            }
+            if !store.agentBudget.isEmpty {
+                Text(store.agentBudget).font(.system(size: 12).monospacedDigit()).foregroundStyle(ArcPalette.secondary)
+            }
+            if !store.agentStatus.isEmpty {
+                Text(store.agentStatus).font(.system(size: 12)).foregroundStyle(ArcPalette.secondary)
+            }
+            Text("В OpenAI іде лише текст такої команди, аудіо — ні. Агент може лише запропонувати дію: вона виконається тільки після «Підтвердити один раз» у панелі плану. Ліміт — $10 на місяць.")
                 .font(.system(size: 12)).foregroundStyle(ArcPalette.secondary).fixedSize(horizontal: false, vertical: true)
         }
     }

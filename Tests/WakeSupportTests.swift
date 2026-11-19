@@ -66,15 +66,24 @@ struct WakeSupportTests {
         check(SpeechEndpoint.trimTrailingSilence(silence(1)).count == 16_000, "All-silence input is left as is")
         check(SpeechEndpoint.trimTrailingSilence(voice(0.5)).count == 8_000, "No trailing silence: unchanged")
 
+        // Activation must be an explicit first-word address, never a mention.
+        for mention in ["Я сказав Jarvis закрий Safari", "Ну, Джарвіс, стоп.",
+                        "Please ask Jarvis to open Terminal", "This is Jarvis, close Safari",
+                        "Джарвісик відкрий браузер", "Jarvis2 open Terminal", "Жарвес, яка погода?",
+                        "Джагрес відкрий пошту", "Відкрий браузер.", "", "— …"] {
+            let result = WakeText.stripLeadingWakeWord(mention)
+            check(!result.found && result.text == mention, "Non-address must not activate: \(mention)")
+        }
+
         // WakeText: the command recording includes the keyword; strip it.
         func strip(_ t: String) -> String { WakeText.stripLeadingWakeWord(t).text }
         check(strip("Джарвіс, відкрий браузер.") == "Відкрий браузер.", "Ukrainian spelling is stripped")
         check(strip("Jarvis, відкрий браузер.") == "Відкрий браузер.", "Latin spelling is stripped")
         check(strip("Jarvis. Open terminal.") == "Open terminal.", "Sentence break after the keyword")
         check(strip("Jarvis Open Terminal") == "Open Terminal", "No punctuation after the keyword")
-        check(strip("Жарвес, яка погода?") == "Яка погода?", "Misheard spelling Жарвес")
-        check(strip("Джагрес відкрий пошту") == "Відкрий пошту", "Misheard spelling Джагрес")
-        check(strip("Ну, Джарвіс, стоп.") == "Стоп.", "Words before the keyword are dropped")
+        check(WakeText.stripPrerollWakeWord("Жарвес, яка погода?").text == "Яка погода?", "Misheard spelling Жарвес")
+        check(WakeText.stripPrerollWakeWord("Джагрес відкрий пошту").text == "Відкрий пошту", "Misheard spelling Джагрес")
+        check(WakeText.stripPrerollWakeWord("Ну, Джарвіс, стоп.").text == "Стоп.", "Words before the keyword are dropped")
         check(WakeText.stripLeadingWakeWord("Джарвіс.") == ("", true), "Keyword alone leaves an empty command")
         check(WakeText.stripLeadingWakeWord("Відкрий браузер.") == ("Відкрий браузер.", false), "No keyword: text unchanged")
         check(strip("Відкрий, будь ласка, сервіс Jarvis") == "Відкрий, будь ласка, сервіс Jarvis", "Keyword after the first three words is kept")
@@ -82,6 +91,30 @@ struct WakeSupportTests {
               "Unrelated words are not the keyword")
         check(!WakeText.isWakeWord("Харків") && !WakeText.isWakeWord("Ярослав") && !WakeText.isWakeWord("Harvard"),
               "Similar-sounding names are not the keyword")
+
+        check(strip("  «ДЖАРВІС», відкрий Safari") == "Відкрий Safari", "Leading whitespace, quotes and case")
+        check(strip("— JARVIS:open Terminal") == "Open Terminal", "Punctuation separates the exact keyword")
+        check(WakeText.command(from: "Я сказав Jarvis закрий Safari", prefixConfirmed: false) == nil,
+              "Raw KWS transcript cannot bypass strict activation")
+        check(WakeText.command(from: "відкрий Safari", prefixConfirmed: false) == nil,
+              "Missing wake word rejects unconfirmed capture")
+        check(WakeText.command(from: "Jarvis, open Terminal", prefixConfirmed: false) == "Open Terminal",
+              "Raw KWS transcript accepts a leading address")
+        check(WakeText.command(from: "відкрий Safari", prefixConfirmed: true) == "відкрий Safari",
+              "A separately confirmed wake word does not need repetition")
+        check(WakeText.command(from: "Ну, Джарвіс, стоп.", prefixConfirmed: true) == "Стоп.",
+              "Preroll cleanup is permitted after confirmed activation")
+        check(WakeText.command(from: "Джарвіс.", prefixConfirmed: false) == "",
+              "Standalone wake word requests a follow-up capture")
+        var seedSegment = UtteranceSegmenter()
+        let longPrefix = Array(voice(4).prefix(512 * 100))
+        check(seedSegment.activationSamples == nil, "Idle KWS cannot invent a seed without a speech segment")
+        _ = seedSegment.feed(longPrefix, start: 0)
+        check(seedSegment.activationSamples == longPrefix, "KWS retains the whole prefix, beyond a 1.5-second lookback")
+        _ = seedSegment.feed(silence(1), start: longPrefix.count)
+        check(seedSegment.activationSamples == nil, "Closed speech segment cannot seed a later unrelated detection")
+        seedSegment.reset()
+        check(seedSegment.activationSamples == nil, "Restart clears the KWS validation seed")
 
         // UtteranceSegmenter: speech segments for Parakeet screening.
         var seg = UtteranceSegmenter()

@@ -7,10 +7,10 @@ import Foundation
 final class WakeListener {
     enum Mode: Equatable { case off, armed, command }
     enum Event: Equatable {
-        /// The keyword fired and a command recording with this generation started.
-        case wake(generation: Int)
+        /// A recording started; only a separately screened leading keyword is confirmed.
+        case wake(generation: Int, prefixConfirmed: Bool)
         /// End-of-speech decision for the wake-started command.
-        case endpoint(SpeechEndpoint.Outcome)
+        case endpoint(SpeechEndpoint.Outcome, generation: Int)
         /// A speech segment heard while armed, for local Parakeet screening.
         /// Dropped by the owner unless its transcript starts with the wake word.
         case utterance(samples: [Float], end: Int, epoch: Int)
@@ -25,12 +25,6 @@ final class WakeListener {
     var threshold: Float = 0.15
     var score: Float = 1.0
     static let commandSeconds = 15
-    /// The command recording starts this far before the detection so it holds
-    /// the whole keyword: en-2023-06-26 fires 0.5–0.8 s after the word ends
-    /// (≈1.3 s after it starts), and a later cut clipped commands spoken
-    /// without a pause ("…відкрий браузер" → "Browser."). The keyword is then
-    /// removed from the transcript (WakeText).
-    static let commandLookback = 1.5
     /// End-of-speech detection starts here, so the keyword itself does not
     /// count as the command and a pause after "Jarvis" is still allowed.
     static let endpointLookback = 0.15
@@ -167,6 +161,7 @@ final class WakeListener {
         case .off:
             return
         case .command:
+            guard let generation = capture.recordingGeneration else { return }
             let outcome = endpoint.feed(chunk.samples)
             guard outcome != .listening else { return }
             debugLog("endpoint=\(outcome) heardSpeech=\(endpoint.heardSpeech)")
@@ -174,7 +169,7 @@ final class WakeListener {
             let current = self.mode == .command && session == ticket
             if current { self.mode = .off; session += 1 }
             lock.unlock()
-            if current { DispatchQueue.main.async { self.onEvent(.endpoint(outcome)) } }
+            if current { DispatchQueue.main.async { self.onEvent(.endpoint(outcome, generation: generation)) } }
         case .armed:
             guard let spotter else { return }
             if needsRestart {
@@ -185,7 +180,10 @@ final class WakeListener {
             for utterance in segmenter.feed(chunk.samples, start: chunk.start) {
                 debugLog(String(format: "utterance %.2f s", Double(utterance.samples.count) / 16_000))
                 DispatchQueue.main.async {
-                    self.onEvent(.utterance(samples: utterance.samples, end: utterance.end, epoch: epochNow))
+                    self.lock.lock()
+                    let current = self.session == ticket && self.mode == .armed
+                    self.lock.unlock()
+                    if current { self.onEvent(.utterance(samples: utterance.samples, end: utterance.end, epoch: epochNow)) }
                 }
             }
             var unused: Float = 0
@@ -202,8 +200,9 @@ final class WakeListener {
                 return
             }
             cooldownUntil = drainedEnd + 16_000 * 2
-            let cut = max(historyStart, drainedEnd - Int(Self.commandLookback * 16_000))
-            let seed = cut < drainedEnd ? Array(history[(cut - historyStart)...]) : []
+            // Preserve the full speech prefix for the strict ASR address check.
+            // A short lookback could turn a mid-sentence mention into a prefix.
+            guard let seed = segmenter.activationSamples else { return }
             lock.lock()
             guard self.mode == .armed, session == ticket else { lock.unlock(); return }
             let generation = capture.beginRecording(seed: seed, maximumSeconds: Self.commandSeconds)
@@ -216,7 +215,7 @@ final class WakeListener {
             lock.unlock()
             needsRestart = true
             segmenter.reset()
-            if let generation { DispatchQueue.main.async { self.onEvent(.wake(generation: generation)) } }
+            if let generation { DispatchQueue.main.async { self.onEvent(.wake(generation: generation, prefixConfirmed: false)) } }
         }
     }
 
@@ -224,13 +223,18 @@ final class WakeListener {
     /// command, starting from the end of that segment so nothing said during
     /// screening is lost. Main thread.
     func startCommand(after end: Int, epoch expected: Int) {
+        lock.lock()
+        let expectedSession = session
+        let armed = mode == .armed
+        lock.unlock()
+        guard armed else { return }
         queue.async {
             guard let capture = self.capture, expected == self.epoch else { return }
             let historyEnd = self.historyStart + self.history.count
             let from = min(max(end, self.historyStart), historyEnd)
             let seed = Array(self.history[(from - self.historyStart)...])
             self.lock.lock()
-            guard self.mode == .armed else { self.lock.unlock(); return }
+            guard self.mode == .armed, self.session == expectedSession else { self.lock.unlock(); return }
             let generation = capture.beginRecording(seed: seed, maximumSeconds: Self.commandSeconds)
             var outcome = SpeechEndpoint.Outcome.listening
             if generation != nil {
@@ -246,8 +250,8 @@ final class WakeListener {
             self.debugLog(String(format: "command after screened keyword, seed %.2f s", Double(seed.count) / 16_000))
             guard let generation else { return }
             DispatchQueue.main.async {
-                self.onEvent(.wake(generation: generation))
-                if outcome != .listening { self.onEvent(.endpoint(outcome)) }
+                self.onEvent(.wake(generation: generation, prefixConfirmed: true))
+                if outcome != .listening { self.onEvent(.endpoint(outcome, generation: generation)) }
             }
         }
     }

@@ -149,18 +149,34 @@ struct SpeechEndpoint {
     }
 }
 
-/// Removes the wake word from the start of a wake-started transcript.
-/// The command recording deliberately starts before the keyword, because the
-/// spotter fires 0.5–0.8 s after the word ends and an earlier cut would clip
-/// a command spoken without a pause. Parakeet spells the keyword in many ways
-/// ("Jarvis", "Джарвіс", "Жарвес", "Джагрес"), so the match is fuzzy and only
-/// looks at the first few words.
+/// Strict first-word activation and separate cleanup for an already confirmed
+/// wake turn. Fuzzy preroll cleanup must never authorize a new activation.
 enum WakeText {
     static let searchWords = 3
 
-    /// Returns the command without the wake word (and anything said before it),
-    /// and whether a wake word was found. Without a match the text is unchanged.
+    /// Only the exact first word Jarvis/Джарвіс authorizes activation.
+    /// Ignore surrounding punctuation, but do not skip spoken words or digits.
     static func stripLeadingWakeWord(_ text: String) -> (text: String, found: Bool) {
+        let start = text.drop(while: { $0.isWhitespace || $0.isPunctuation })
+        let word = start.prefix(while: { $0.isLetter })
+        guard ["jarvis", "джарвіс"].contains(word.lowercased()) else { return (text, false) }
+        let rest = start.dropFirst(word.count)
+        guard rest.isEmpty || rest.first!.isWhitespace || rest.first!.isPunctuation else { return (text, false) }
+        let command = rest.drop(while: { $0.isWhitespace || $0.isPunctuation })
+        return (command.prefix(1).uppercased() + command.dropFirst(), true)
+    }
+
+    /// nil means an unconfirmed background mention and must not be executed,
+    /// displayed as an accepted command, or logged as a conversation turn.
+    static func command(from text: String, prefixConfirmed: Bool) -> String? {
+        if prefixConfirmed { return stripPrerollWakeWord(text).text }
+        let address = stripLeadingWakeWord(text)
+        return address.found ? address.text : nil
+    }
+
+    /// Tolerant cleanup only after a separate leading wake word was confirmed.
+    /// It may remove preroll and ASR misspellings from the command capture.
+    static func stripPrerollWakeWord(_ text: String) -> (text: String, found: Bool) {
         let words = text.split(whereSeparator: { $0.isWhitespace })
         for index in 0..<min(searchWords, words.count) where isWakeWord(String(words[index])) {
             let rest = words[(index + 1)...].joined(separator: " ")
@@ -225,6 +241,9 @@ struct UtteranceSegmenter {
     var minVoicedSeconds = 0.25       // shorter bursts are not screened
 
     private(set) var inUtterance = false
+    /// Whole current speech segment for strict KWS validation: a fixed short
+    /// lookback could clip words before an incidental mention of Jarvis.
+    var activationSamples: [Float]? { inUtterance ? current : nil }
     /// Absolute end of the last closed segment (emitted or not).
     private(set) var lastEnd: Int?
     private var pending: [Float] = []

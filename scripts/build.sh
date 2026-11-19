@@ -43,10 +43,15 @@ swiftc "${SWIFT_FLAGS[@]}" -swift-version 5 -Onone -parse-as-library Sources/Dia
 swiftc "${SWIFT_FLAGS[@]}" -swift-version 5 -Onone -parse-as-library Sources/Acknowledgment.swift Tests/AcknowledgmentTests.swift -o .build/acknowledgment-tests
 swiftc "${SWIFT_FLAGS[@]}" -swift-version 5 -Onone -parse-as-library Sources/TranscriptCleanup.swift Tests/TranscriptCleanupTests.swift -o .build/transcript-cleanup-tests
 swiftc "${SWIFT_FLAGS[@]}" -swift-version 5 -Onone -parse-as-library Sources/CloudVoice.swift Tests/CloudVoiceTests.swift -o .build/cloud-voice-tests
+swiftc "${SWIFT_FLAGS[@]}" -swift-version 5 -Onone -parse-as-library Sources/AgentPersona.swift Tests/AgentPersonaTests.swift -o .build/agent-persona-tests
+swiftc "${SWIFT_FLAGS[@]}" -swift-version 5 -Onone -parse-as-library Sources/ConversationLog.swift Tests/ConversationLogTests.swift -o .build/conversation-log-tests
 # ChatGPT's action and agent modules: their own scripts and overlays.
 bash scripts/test-actions.sh
 bash scripts/test-agent.sh
+bash scripts/test-turn-control.sh
 .build/cloud-voice-tests
+.build/agent-persona-tests
+.build/conversation-log-tests
 .build/transcript-cleanup-tests
 .build/acknowledgment-tests
 .build/diagnostic-tests
@@ -84,17 +89,39 @@ fi
 if [[ -f Sources/App.swift ]]; then
 APP="$ROOT/dist/Jarvis Voice Lab.app"
 mkdir -p "$APP/Contents/MacOS"
-swiftc "${SWIFT_FLAGS[@]}" -swift-version 5 -O -parse-as-library -import-objc-header Sources/Bridging.h Sources/App.swift Sources/Audio.swift Sources/AudioMetrics.swift Sources/VoiceState.swift Sources/ArcRenderer.swift Sources/ArcViews.swift Sources/WakeSupport.swift Sources/WakeListener.swift Sources/Measurement.swift Sources/Diagnostic.swift Sources/Acknowledgment.swift Sources/TranscriptCleanup.swift Sources/SpeechOutput.swift Sources/Actions/*.swift Sources/CloudVoice.swift Sources/Parakeet.swift .build/WhisperBridge.o .build/WakeBridge.o "${LIBS[@]}" "${WAKE_LIBS[@]}" "${FRAMEWORKS[@]}" -framework AppKit -framework SwiftUI -framework AVFoundation -framework Carbon -framework ApplicationServices -framework CoreAudio -lc++ -o "$APP/Contents/MacOS/JarvisVoiceLab"
+swiftc "${SWIFT_FLAGS[@]}" -swift-version 5 -O -parse-as-library -import-objc-header Sources/Bridging.h Sources/App.swift Sources/TurnControl.swift Sources/Audio.swift Sources/AudioMetrics.swift Sources/VoiceState.swift Sources/ArcRenderer.swift Sources/ArcViews.swift Sources/WakeSupport.swift Sources/WakeListener.swift Sources/Measurement.swift Sources/Diagnostic.swift Sources/Acknowledgment.swift Sources/TranscriptCleanup.swift Sources/SpeechOutput.swift Sources/AgentPersona.swift Sources/ConversationLog.swift Sources/AgentTiming.swift Sources/Actions/*.swift Sources/Actions/UI/*.swift Sources/Agent/*.swift Sources/CloudVoice.swift Sources/Parakeet.swift .build/WhisperBridge.o .build/WakeBridge.o "${LIBS[@]}" "${WAKE_LIBS[@]}" "${FRAMEWORKS[@]}" -framework AppKit -framework SwiftUI -framework AVFoundation -framework Carbon -framework ApplicationServices -framework CoreAudio -lc++ -o "$APP/Contents/MacOS/JarvisVoiceLab"
 python3 - "$APP/Contents/Info.plist" "$ROOT" <<'PY'
 import plistlib,sys
 with open(sys.argv[1],'wb') as f:
- plistlib.dump(dict(CFBundleExecutable='JarvisVoiceLab',CFBundleIdentifier='local.jarvis.voicelab',CFBundleName='Jarvis Voice Lab',CFBundleVersion='1',CFBundleShortVersionString='0.1.0',LSMinimumSystemVersion='14.0',NSMicrophoneUsageDescription='Jarvis розпізнає голос локально на цьому Mac: під час утримання ⌃⌥Пробіл, а якщо ви ввімкнули активацію — постійно слухає лише слово «Jarvis». Аудіо не зберігається і не надсилається.',JarvisProjectRoot=sys.argv[2]),f)
+ plistlib.dump(dict(CFBundleExecutable='JarvisVoiceLab',CFBundleIdentifier='local.jarvis.voicelab',CFBundleName='Jarvis Voice Lab',CFBundleVersion='1',CFBundleShortVersionString='0.1.0',LSMinimumSystemVersion='14.0',NSMicrophoneUsageDescription='Jarvis розпізнає голос локально на цьому Mac: під час утримання ⌃⌥Пробіл, а якщо ви ввімкнули активацію — розпізнає фрази локально й відкидає ті, що не починаються з «Jarvis». Аудіо не зберігається і не надсилається.',JarvisProjectRoot=sys.argv[2]),f)
 PY
+# AI agent: MCP relay helper (its own @main, never in the app target) and the
+# pinned goose-acp 1.58.1, verified by SHA-256 and copied unmodified.
+mkdir -p "$APP/Contents/Helpers"
+swiftc "${SWIFT_FLAGS[@]}" -swift-version 5 -O -parse-as-library Sources/Actions/*.swift Sources/Agent/*.swift Sources/Agent/Helper/Main.swift -framework AppKit -framework ApplicationServices -framework CoreAudio -o "$APP/Contents/Helpers/JarvisMCPHelper"
+GOOSE_ACP="$ROOT/.runtime/research-goose/v1.58.1/acp/goose-acp"
+GOOSE_SHA=6e1ffe11b7e54db34adf56a1ef1f3bf3c3493c8ac259ad45c49eb8299e73e0b7
+if [[ -f "$GOOSE_ACP" && "$(shasum -a 256 "$GOOSE_ACP" | cut -d' ' -f1)" == "$GOOSE_SHA" ]]; then
+  cp "$GOOSE_ACP" "$APP/Contents/Helpers/goose-acp"
+else
+  rm -f "$APP/Contents/Helpers/goose-acp"
+  echo "goose-acp 1.58.1 not found or checksum mismatch: the AI agent is disabled in this build" >&2
+fi
 mkdir -p "$APP/Contents/Resources"
 cp "$W/LICENSE" "$APP/Contents/Resources/whisper-LICENSE"
 cp THIRD_PARTY.md "$APP/Contents/Resources/THIRD_PARTY.md"
 cp "$SHERPA/LICENSE" "$APP/Contents/Resources/sherpa-onnx-LICENSE"
+[[ -f "$ROOT/.runtime/research-goose/v1.58.1/src/LICENSE" ]] && cp "$ROOT/.runtime/research-goose/v1.58.1/src/LICENSE" "$APP/Contents/Resources/goose-LICENSE"
 cp "$KWS/README.md" "$APP/Contents/Resources/kws-zipformer-en-2023-06-26-README.md"
-codesign --force --sign - "$APP"
+# A stable local identity keeps Keychain "Always Allow" across rebuilds; an
+# ad-hoc signature changes every build, so macOS asks again for the API keys.
+# Create it once in Keychain Access (see docs/LOCAL-SIGNING.md).
+SIGN_ID="${JARVIS_SIGN_IDENTITY:-Jarvis Local Signing}"
+if security find-certificate -c "$SIGN_ID" >/dev/null 2>&1 && codesign --force --sign "$SIGN_ID" "$APP"; then
+  echo "Signed with local identity: $SIGN_ID"
+else
+  codesign --force --sign - "$APP"
+  echo "Signed ad-hoc (no \"$SIGN_ID\" certificate): Keychain will ask again after each build."
+fi
 codesign --verify --strict "$APP"
 fi
