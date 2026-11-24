@@ -59,14 +59,22 @@ struct AppAliases: Codable {
         try Task.checkCancellation()
         let config = NSWorkspace.OpenConfiguration()
         config.activates = true
-        return try await withCheckedThrowingContinuation { continuation in
+        let app: NSRunningApplication? = try await withCheckedThrowingContinuation { continuation in
             workspace.openApplication(at: url, configuration: config) { app, error in
                 Task { @MainActor in
-                    if let error { continuation.resume(throwing: error) }
-                    else { continuation.resume(returning: app.map { !$0.isTerminated && $0.isFinishedLaunching } ?? false) }
+                    if let error { continuation.resume(throwing: error) } else { continuation.resume(returning: app) }
                 }
             }
         }
+        guard let app, !app.isTerminated else { return false }
+        // On a cold start the completion arrives before the app has finished
+        // launching (live run 24.11.2026: Calculator and Calendar opened but were
+        // reported as failed). Wait up to 3 s; a launch still in progress counts.
+        for _ in 0..<60 where !app.isFinishedLaunching {
+            if app.isTerminated { return false }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        return !app.isTerminated
     }
     func activateApplication(_ url: URL) async throws -> Bool {
         try Task.checkCancellation()
@@ -87,7 +95,8 @@ struct AppAliases: Codable {
             try Task.checkCancellation()
             guard app.terminate() else { return false }
         }
-        for _ in 0..<40 {
+        // Some apps take a few seconds to quit (Calendar took >2 s on 24.11.2026).
+        for _ in 0..<100 {
             if running(url).isEmpty { return true }
             try await Task.sleep(nanoseconds: 50_000_000)
         }

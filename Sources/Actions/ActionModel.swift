@@ -5,6 +5,8 @@ enum Action: Equatable, Codable, Sendable {
     case openApp(String), quitApp(String), activateApp(String)
     case openURL(String), webSearch(String)
     case windowMinimize, windowMaximize, windowLeftHalf, windowRightHalf
+    /// Every standard window of every other application (not Jarvis's own).
+    case windowMinimizeAll
     case volumeSet(Int), volumeStep(Int), mute(Bool), dictate(String)
 }
 

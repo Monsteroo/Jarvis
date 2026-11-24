@@ -107,7 +107,7 @@ final class ActionExecutor: CommandHandling {
             return try await openWeb(WebActions.validatedURL(raw), language: language)
         case .webSearch(let query):
             return try await openWeb(WebActions.searchURL(query), language: language)
-        case .windowMinimize, .windowMaximize, .windowLeftHalf, .windowRightHalf:
+        case .windowMinimize, .windowMaximize, .windowLeftHalf, .windowRightHalf, .windowMinimizeAll:
             if let windows { return await windows.perform(action, language: language) }
             return .failed(reason: actionText(language, "Керування вікнами не підключено.", "Window control is not connected."))
         case .volumeSet, .volumeStep, .mute:

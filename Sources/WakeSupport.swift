@@ -154,12 +154,14 @@ struct SpeechEndpoint {
 enum WakeText {
     static let searchWords = 3
 
-    /// Only the exact first word Jarvis/Джарвіс authorizes activation.
-    /// Ignore surrounding punctuation, but do not skip spoken words or digits.
+    /// Only the first word can authorize activation: Jarvis/Джарвіс or a close
+    /// ASR spelling of it (Джарвис, Жарвес, Джарвісе). A mention later in the
+    /// sentence never activates. Ignore surrounding punctuation, but do not
+    /// skip spoken words or digits.
     static func stripLeadingWakeWord(_ text: String) -> (text: String, found: Bool) {
         let start = text.drop(while: { $0.isWhitespace || $0.isPunctuation })
         let word = start.prefix(while: { $0.isLetter })
-        guard ["jarvis", "джарвіс"].contains(word.lowercased()) else { return (text, false) }
+        guard isLeadingAddress(String(word)) else { return (text, false) }
         let rest = start.dropFirst(word.count)
         guard rest.isEmpty || rest.first!.isWhitespace || rest.first!.isPunctuation else { return (text, false) }
         let command = rest.drop(while: { $0.isWhitespace || $0.isPunctuation })
@@ -184,6 +186,23 @@ enum WakeText {
             return (trimmed.prefix(1).uppercased() + trimmed.dropFirst(), true)
         }
         return (text, false)
+    }
+
+    /// First word only, for the opt-in debug trace.
+    static func firstWord(_ text: String) -> String {
+        String(text.drop(while: { $0.isWhitespace || $0.isPunctuation }).prefix(while: { $0.isLetter || $0.isNumber }).prefix(20))
+    }
+
+    /// First-word address check, tighter than `isWakeWord`: live run on
+    /// 24 November 2026 lost 12 of 15 addresses to exact matching, because
+    /// Parakeet spells the name several ways. One edit is always accepted;
+    /// two only when the word starts with the J sound (Д/Дж/Ж/J), so
+    /// Дарвін, Travis or Джагрес stay out.
+    static func isLeadingAddress(_ word: String) -> Bool {
+        let latin = transliterate(word.lowercased())
+        guard (4...9).contains(latin.count), latin.allSatisfy({ $0.isLetter }) else { return false }
+        let edits = distance(latin, "jarvis")
+        return edits <= 1 || (edits <= 2 && latin.hasPrefix("j"))
     }
 
     static func isWakeWord(_ word: String) -> Bool {

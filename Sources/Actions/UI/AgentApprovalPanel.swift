@@ -108,6 +108,7 @@ import SwiftUI
         case .openURL(let url): return actionText(language, "Відкрити сайт: ", "Open URL: ") + literal(url)
         case .webSearch(let query): return actionText(language, "Пошук: ", "Search: ") + literal(query)
         case .windowMinimize: return actionText(language, "Згорнути активне вікно", "Minimize active window")
+        case .windowMinimizeAll: return actionText(language, "Згорнути всі вікна", "Minimize all windows")
         case .windowMaximize: return actionText(language, "Розгорнути активне вікно", "Maximize active window")
         case .windowLeftHalf: return actionText(language, "Активне вікно — ліворуч", "Active window — left half")
         case .windowRightHalf: return actionText(language, "Активне вікно — праворуч", "Active window — right half")

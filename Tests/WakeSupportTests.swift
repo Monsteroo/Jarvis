@@ -69,10 +69,19 @@ struct WakeSupportTests {
         // Activation must be an explicit first-word address, never a mention.
         for mention in ["Я сказав Jarvis закрий Safari", "Ну, Джарвіс, стоп.",
                         "Please ask Jarvis to open Terminal", "This is Jarvis, close Safari",
-                        "Джарвісик відкрий браузер", "Jarvis2 open Terminal", "Жарвес, яка погода?",
-                        "Джагрес відкрий пошту", "Відкрий браузер.", "", "— …"] {
+                        "Jarvis2 open Terminal", "Джагрес відкрий пошту", "Відкрий браузер.", "", "— …",
+                        "Я сказав Джарвис закрий Safari", "Дарвін відкрив теорію", "Travis, open Safari",
+                        "Джерело відкрий", "Чарльз, стоп", "Сервіс відкрий", "Jar open"] {
             let result = WakeText.stripLeadingWakeWord(mention)
             check(!result.found && result.text == mention, "Non-address must not activate: \(mention)")
+        }
+        // Live run 24.11.2026: ASR spells the leading name several ways.
+        for (heard, command) in [("Джарвис, відкрий Safari.", "Відкрий Safari."), ("Жарвес, яка погода?", "Яка погода?"),
+                                 ("Джарвісе, стоп.", "Стоп."), ("Джервіс відкрий термінал", "Відкрий термінал"),
+                                 ("Джарвісик відкрий браузер", "Відкрий браузер"), ("Jervis, open Terminal", "Open Terminal"),
+                                 ("Дарвіс, пауза", "Пауза"), ("Джарвіз відкрий пошту", "Відкрий пошту")] {
+            let result = WakeText.stripLeadingWakeWord(heard)
+            check(result.found && result.text == command, "Leading ASR spelling activates: \(heard) → \(result.text)")
         }
 
         // WakeText: the command recording includes the keyword; strip it.

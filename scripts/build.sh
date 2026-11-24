@@ -45,6 +45,7 @@ swiftc "${SWIFT_FLAGS[@]}" -swift-version 5 -Onone -parse-as-library Sources/Tra
 swiftc "${SWIFT_FLAGS[@]}" -swift-version 5 -Onone -parse-as-library Sources/CloudVoice.swift Tests/CloudVoiceTests.swift -o .build/cloud-voice-tests
 swiftc "${SWIFT_FLAGS[@]}" -swift-version 5 -Onone -parse-as-library Sources/AgentPersona.swift Tests/AgentPersonaTests.swift -o .build/agent-persona-tests
 swiftc "${SWIFT_FLAGS[@]}" -swift-version 5 -Onone -parse-as-library Sources/ConversationLog.swift Tests/ConversationLogTests.swift -o .build/conversation-log-tests
+swiftc "${SWIFT_FLAGS[@]}" -swift-version 5 -Onone -parse-as-library Sources/Brain/*.swift Sources/AgentPersona.swift Sources/Actions/*.swift Sources/Agent/*.swift Tests/BrainTests.swift -framework AppKit -framework ApplicationServices -framework CoreAudio -o .build/brain-tests
 # ChatGPT's action and agent modules: their own scripts and overlays.
 bash scripts/test-actions.sh
 bash scripts/test-agent.sh
@@ -52,6 +53,7 @@ bash scripts/test-turn-control.sh
 .build/cloud-voice-tests
 .build/agent-persona-tests
 .build/conversation-log-tests
+.build/brain-tests
 .build/transcript-cleanup-tests
 .build/acknowledgment-tests
 .build/diagnostic-tests
@@ -89,11 +91,11 @@ fi
 if [[ -f Sources/App.swift ]]; then
 APP="$ROOT/dist/Jarvis Voice Lab.app"
 mkdir -p "$APP/Contents/MacOS"
-swiftc "${SWIFT_FLAGS[@]}" -swift-version 5 -O -parse-as-library -import-objc-header Sources/Bridging.h Sources/App.swift Sources/TurnControl.swift Sources/Audio.swift Sources/AudioMetrics.swift Sources/VoiceState.swift Sources/ArcRenderer.swift Sources/ArcViews.swift Sources/WakeSupport.swift Sources/WakeListener.swift Sources/Measurement.swift Sources/Diagnostic.swift Sources/Acknowledgment.swift Sources/TranscriptCleanup.swift Sources/SpeechOutput.swift Sources/AgentPersona.swift Sources/ConversationLog.swift Sources/AgentTiming.swift Sources/Actions/*.swift Sources/Actions/UI/*.swift Sources/Agent/*.swift Sources/CloudVoice.swift Sources/Parakeet.swift .build/WhisperBridge.o .build/WakeBridge.o "${LIBS[@]}" "${WAKE_LIBS[@]}" "${FRAMEWORKS[@]}" -framework AppKit -framework SwiftUI -framework AVFoundation -framework Carbon -framework ApplicationServices -framework CoreAudio -lc++ -o "$APP/Contents/MacOS/JarvisVoiceLab"
+swiftc "${SWIFT_FLAGS[@]}" -swift-version 5 -O -parse-as-library -import-objc-header Sources/Bridging.h Sources/App.swift Sources/TurnControl.swift Sources/Audio.swift Sources/AudioMetrics.swift Sources/VoiceState.swift Sources/ArcRenderer.swift Sources/ArcViews.swift Sources/WakeSupport.swift Sources/WakeListener.swift Sources/Measurement.swift Sources/Diagnostic.swift Sources/Acknowledgment.swift Sources/TranscriptCleanup.swift Sources/SpeechOutput.swift Sources/AgentPersona.swift Sources/ConversationLog.swift Sources/AgentTiming.swift Sources/Brain/*.swift Sources/Actions/*.swift Sources/Actions/UI/*.swift Sources/Agent/*.swift Sources/CloudVoice.swift Sources/Parakeet.swift .build/WhisperBridge.o .build/WakeBridge.o "${LIBS[@]}" "${WAKE_LIBS[@]}" "${FRAMEWORKS[@]}" -framework AppKit -framework SwiftUI -framework AVFoundation -framework Carbon -framework ApplicationServices -framework CoreAudio -lc++ -o "$APP/Contents/MacOS/JarvisVoiceLab"
 python3 - "$APP/Contents/Info.plist" "$ROOT" <<'PY'
 import plistlib,sys
 with open(sys.argv[1],'wb') as f:
- plistlib.dump(dict(CFBundleExecutable='JarvisVoiceLab',CFBundleIdentifier='local.jarvis.voicelab',CFBundleName='Jarvis Voice Lab',CFBundleVersion='1',CFBundleShortVersionString='0.1.0',LSMinimumSystemVersion='14.0',NSMicrophoneUsageDescription='Jarvis розпізнає голос локально на цьому Mac: під час утримання ⌃⌥Пробіл, а якщо ви ввімкнули активацію — розпізнає фрази локально й відкидає ті, що не починаються з «Jarvis». Аудіо не зберігається і не надсилається.',JarvisProjectRoot=sys.argv[2]),f)
+ plistlib.dump(dict(CFBundleExecutable='JarvisVoiceLab',CFBundleIdentifier='local.jarvis.voicelab',CFBundleName='Jarvis',CFBundleDisplayName='Jarvis',CFBundleIconFile='AppIcon',CFBundleVersion='1',CFBundleShortVersionString='0.1.0',LSMinimumSystemVersion='14.0',NSMicrophoneUsageDescription='Jarvis розпізнає голос локально на цьому Mac: під час утримання ⌃⌥Пробіл, а якщо ви ввімкнули активацію — розпізнає фрази локально й відкидає ті, що не починаються з «Jarvis». Аудіо не зберігається і не надсилається.',JarvisProjectRoot=sys.argv[2]),f)
 PY
 # AI agent: MCP relay helper (its own @main, never in the app target) and the
 # pinned goose-acp 1.58.1, verified by SHA-256 and copied unmodified.
@@ -108,6 +110,16 @@ else
   echo "goose-acp 1.58.1 not found or checksum mismatch: the AI agent is disabled in this build" >&2
 fi
 mkdir -p "$APP/Contents/Resources"
+# App icon (ARC Current filaments), rendered from code: scripts/icon/make-icon.swift.
+swiftc "${SWIFT_FLAGS[@]}" -O scripts/icon/make-icon.swift -o .build/make-icon
+ICONSET=.build/AppIcon.iconset
+rm -rf "$ICONSET"; mkdir -p "$ICONSET"
+.build/make-icon .build/icon-1024.png >/dev/null
+for s in 16 32 128 256 512; do
+  sips -z $s $s .build/icon-1024.png --out "$ICONSET/icon_${s}x${s}.png" >/dev/null
+  sips -z $((s*2)) $((s*2)) .build/icon-1024.png --out "$ICONSET/icon_${s}x${s}@2x.png" >/dev/null
+done
+iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns"
 cp "$W/LICENSE" "$APP/Contents/Resources/whisper-LICENSE"
 cp THIRD_PARTY.md "$APP/Contents/Resources/THIRD_PARTY.md"
 cp "$SHERPA/LICENSE" "$APP/Contents/Resources/sherpa-onnx-LICENSE"
@@ -124,4 +136,12 @@ else
   echo "Signed ad-hoc (no \"$SIGN_ID\" certificate): Keychain will ask again after each build."
 fi
 codesign --verify --strict "$APP"
+# Install a copy as /Applications/Jarvis.app so it shows in Launchpad and
+# Finder → Applications. Remove first (unlink), so a running copy keeps its
+# open files. JARVIS_INSTALL=0 skips this.
+if [[ "${JARVIS_INSTALL:-1}" == "1" ]]; then
+  DEST="${JARVIS_INSTALL_DIR:-/Applications}/Jarvis.app"
+  rm -rf "$DEST" && ditto "$APP" "$DEST" && codesign --verify --strict "$DEST" && echo "Installed: $DEST"
+  /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$DEST" >/dev/null 2>&1 || true
+fi
 fi

@@ -43,7 +43,7 @@ actor AgentMCPBridge {
     private var schema: JSONValue {
         .object(["type": .string("object"), "additionalProperties": .bool(false),
             "required": .array([.string("kind")]), "properties": .object([
-                "kind": .object(["type": .string("string"), "enum": .array(["openApp", "activateApp", "quitApp", "openURL", "webSearch", "windowMinimize", "windowMaximize", "windowLeftHalf", "windowRightHalf", "volumeSet", "volumeStep", "mute"].map(JSONValue.string))]),
+                "kind": .object(["type": .string("string"), "enum": .array(["openApp", "activateApp", "quitApp", "openURL", "webSearch", "windowMinimize", "windowMaximize", "windowLeftHalf", "windowRightHalf", "windowMinimizeAll", "volumeSet", "volumeStep", "mute"].map(JSONValue.string))]),
                 "target": .object(["type": .string("string"), "maxLength": .number(2048)]),
                 "value": .object(["type": .string("integer"), "minimum": .number(-100), "maximum": .number(100)]),
                 "muted": .object(["type": .string("boolean")])])])
@@ -70,6 +70,7 @@ actor AgentMCPBridge {
             allowed = ["kind"]
             switch kind { case "windowMinimize": action = .windowMinimize; case "windowMaximize": action = .windowMaximize
             case "windowLeftHalf": action = .windowLeftHalf; case "windowRightHalf": action = .windowRightHalf
+            case "windowMinimizeAll": action = .windowMinimizeAll
             default: throw AgentError.invalidMessage }
         }
         guard Set(fields.keys) == allowed else { throw AgentError.invalidMessage }

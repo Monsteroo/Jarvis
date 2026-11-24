@@ -25,7 +25,7 @@ struct ActionRegistry {
     func policy(for action: Action) -> ApprovalPolicy {
         switch action {
         case .openApp, .activateApp, .quitApp, .openURL, .webSearch,
-             .windowMinimize, .windowMaximize, .windowLeftHalf, .windowRightHalf,
+             .windowMinimize, .windowMaximize, .windowLeftHalf, .windowRightHalf, .windowMinimizeAll,
              .volumeSet, .volumeStep, .mute, .dictate: return .immediate
         }
     }

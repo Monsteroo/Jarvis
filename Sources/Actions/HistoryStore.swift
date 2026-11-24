@@ -64,6 +64,7 @@ actor HistoryStore {
         case .openURL: kind = "openURL"; case .webSearch: kind = "webSearch"
         case .windowMinimize: kind = "windowMinimize"; case .windowMaximize: kind = "windowMaximize"
         case .windowLeftHalf: kind = "windowLeftHalf"; case .windowRightHalf: kind = "windowRightHalf"
+        case .windowMinimizeAll: kind = "windowMinimizeAll"
         case .volumeSet: kind = "volumeSet"; case .volumeStep: kind = "volumeStep"; case .mute: kind = "mute"
         case .dictate: kind = "dictate"
         }

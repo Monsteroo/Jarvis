@@ -34,6 +34,8 @@ enum DeviceActionError: Error { case unavailable, unsupported, writeFailed }
 @MainActor protocol WindowAccess {
     var trusted: Bool { get }
     func target() throws -> WindowTarget
+    /// Standard, not yet minimized windows of every other application.
+    func allTargets() -> [WindowTarget]
 }
 
 @MainActor struct WindowActions {
@@ -44,6 +46,7 @@ enum DeviceActionError: Error { case unavailable, unsupported, writeFailed }
         guard access.trusted else {
             return .failed(reason: actionText(language, "Надайте Jarvis дозвіл у Системні параметри → Приватність і безпека → Доступність.", "Allow Jarvis in System Settings → Privacy & Security → Accessibility."))
         }
+        if action == .windowMinimizeAll { return await minimizeAll(language: language) }
         var wrote = false
         do {
             // Retain exactly this AX window across suspension; never silently retarget.
@@ -78,14 +81,41 @@ enum DeviceActionError: Error { case unavailable, unsupported, writeFailed }
         } catch { /* A write may have completed before cancellation/readback failure. */ }
         return wrote ? .partial(summary: actionText(language, "Вікно могло змінитися частково.", "The window may have changed partially."), details: fail) : .failed(reason: fail)
     }
+
+    /// Minimizes every window it can and reports the count it saw minimized.
+    private func minimizeAll(language: String) async -> CommandOutcome {
+        let targets = access.allTargets().filter { $0.canSet(.minimized) && (try? $0.readMinimized()) == false }
+        guard !targets.isEmpty else {
+            return .done(summary: actionText(language, "Відкритих вікон для згортання немає.", "There are no open windows to minimize."))
+        }
+        var wrote = 0
+        for target in targets {
+            guard !Task.isCancelled else { break }
+            if (try? target.setMinimized(true)) != nil { wrote += 1 }
+        }
+        guard wrote > 0 else {
+            return Task.isCancelled ? .failed(reason: actionText(language, "Запит скасовано.", "Request cancelled."))
+                : .failed(reason: actionText(language, "Не вдалося згорнути вікна.", "Unable to minimize the windows."))
+        }
+        var confirmed = 0
+        for _ in 0..<10 {
+            confirmed = targets.filter { (try? $0.readMinimized()) == true }.count
+            if confirmed == targets.count { break }
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+        if confirmed == targets.count {
+            return .done(summary: actionText(language, "Згорнуто вікон: \(confirmed).", "Minimized \(confirmed) windows."))
+        }
+        return .partial(summary: actionText(language, "Згорнуто вікон: \(confirmed) з \(targets.count).", "Minimized \(confirmed) of \(targets.count) windows."),
+                        details: actionText(language, "Деякі вікна не підтримують згортання.", "Some windows do not support minimizing."))
+    }
 }
 
 @MainActor struct MacWindowAccess: WindowAccess {
     var trusted: Bool { AXIsProcessTrusted() }
     func target() throws -> WindowTarget {
-        guard trusted, let app = NSWorkspace.shared.frontmostApplication,
-              app.processIdentifier != ProcessInfo.processInfo.processIdentifier else { throw DeviceActionError.unavailable }
-        let axApp = AXUIElementCreateApplication(app.processIdentifier)
+        guard trusted, let pid = Self.frontApplicationPID() else { throw DeviceActionError.unavailable }
+        let axApp = AXUIElementCreateApplication(pid)
         AXUIElementSetMessagingTimeout(axApp, 0.25)
         var value: CFTypeRef?
         guard AXUIElementCopyAttributeValue(axApp, kAXFocusedWindowAttribute as CFString, &value) == .success,
@@ -103,6 +133,50 @@ enum DeviceActionError: Error { case unavailable, unsupported, writeFailed }
         let areas = NSScreen.screens.map { WindowGeometry.axFrame(fromAppKit: $0.visibleFrame, primaryTop: primary.frame.maxY) }
         guard let best = areas.max(by: { $0.intersection(current).area < $1.intersection(current).area }) else { throw DeviceActionError.unavailable }
         result.visibleFrame = best
+        return result
+    }
+}
+extension MacWindowAccess {
+    /// The front application, or, when Jarvis itself is in front (the owner
+    /// was looking at it), the application whose window is right behind it.
+    /// Jarvis's own window is never a target.
+    static func frontApplicationPID() -> pid_t? {
+        let own = ProcessInfo.processInfo.processIdentifier
+        if let app = NSWorkspace.shared.frontmostApplication, app.processIdentifier != own { return app.processIdentifier }
+        guard let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] else { return nil }
+        for info in list {
+            guard (info[kCGWindowLayer as String] as? Int) == 0,
+                  let pid = info[kCGWindowOwnerPID as String] as? Int32, pid != own,
+                  NSRunningApplication(processIdentifier: pid)?.activationPolicy == .regular else { continue }
+            return pid
+        }
+        return nil
+    }
+
+    func allTargets() -> [WindowTarget] {
+        guard trusted else { return [] }
+        let own = ProcessInfo.processInfo.processIdentifier
+        var result: [WindowTarget] = []
+        for app in NSWorkspace.shared.runningApplications
+        where app.activationPolicy == .regular && app.processIdentifier != own && !app.isHidden {
+            let axApp = AXUIElementCreateApplication(app.processIdentifier)
+            AXUIElementSetMessagingTimeout(axApp, 0.25)
+            var value: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(axApp, kAXWindowsAttribute as CFString, &value) == .success,
+                  let windows = value as? [AXUIElement] else { continue }
+            for window in windows.prefix(40) {
+                AXUIElementSetMessagingTimeout(window, 0.25)
+                var subrole: CFTypeRef?
+                guard AXUIElementCopyAttributeValue(window, kAXSubroleAttribute as CFString, &subrole) == .success,
+                      (subrole as? String) == (kAXStandardWindowSubrole as String) else { continue }
+                // Full-screen windows cannot be minimized.
+                var fullScreen: CFTypeRef?
+                if AXUIElementCopyAttributeValue(window, "AXFullScreen" as CFString, &fullScreen) == .success,
+                   (fullScreen as? Bool) == true { continue }
+                result.append(MacWindowTarget(window))
+            }
+            if result.count >= 120 { break }
+        }
         return result
     }
 }

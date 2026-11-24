@@ -78,6 +78,14 @@ final class VoiceStore: ObservableObject {
         didSet { UserDefaults.standard.set(conversationLog, forKey: "conversationLog") }
     }
     @Published var conversationLogStatus = ""
+    /// Owner decision 24.11.2026 (D1): direct OpenAI "brain" instead of a Goose process per request.
+    @Published var brainEnabled = UserDefaults.standard.object(forKey: "brainEnabled") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(brainEnabled, forKey: "brainEnabled") }
+    }
+    /// Owner decision 24.11.2026: AI-proposed actions run at once; this brings the review panel back.
+    @Published var confirmAgentActions = UserDefaults.standard.object(forKey: "confirmAgentActions") as? Bool ?? false {
+        didSet { UserDefaults.standard.set(confirmAgentActions, forKey: "confirmAgentActions") }
+    }
     /// AI agent for requests the simple rules do not understand (opt-out).
     @Published var agentEnabled = UserDefaults.standard.object(forKey: "agentEnabled") as? Bool ?? true {
         didSet { UserDefaults.standard.set(agentEnabled, forKey: "agentEnabled") }
@@ -220,8 +228,13 @@ private struct GlassPanel: ViewModifier {
     var tint: Color = ArcPalette.stroke
     func body(content: Content) -> some View {
         content
-            .background(RoundedRectangle(cornerRadius: radius).fill(ArcPalette.panel))
-            .overlay(RoundedRectangle(cornerRadius: radius).strokeBorder(tint, lineWidth: 1))
+            .background(RoundedRectangle(cornerRadius: radius).fill(
+                LinearGradient(colors: [Color.white.opacity(0.06), ArcPalette.cyan.opacity(0.025)],
+                               startPoint: .top, endPoint: .bottom)))
+            .background(RoundedRectangle(cornerRadius: radius).fill(ArcPalette.background.opacity(0.55)))
+            .overlay(RoundedRectangle(cornerRadius: radius).strokeBorder(
+                LinearGradient(colors: [tint.opacity(1.6), tint.opacity(0.6)], startPoint: .top, endPoint: .bottom),
+                lineWidth: 1))
     }
 }
 
@@ -306,12 +319,30 @@ struct StateLabel: View {
                 .tracking(size * 0.22)
         }
         .foregroundStyle(store.phase == .microphoneOff ? ArcPalette.secondary : ArcPalette.cyan)
+        .shadow(color: store.phase == .microphoneOff ? .clear : ArcPalette.cyan.opacity(0.6), radius: 9)
         .accessibilityElement(children: .combine)
         .accessibilityLabel("Стан: \(store.headline)")
     }
 }
 
 // MARK: - Main window
+
+/// Static ARC Current atmosphere: deep navy, a cyan bloom behind the
+/// filaments and a faint amber horizon. Decoration only: nothing here moves
+/// or reacts, so it never pretends to show audio or progress.
+struct ArcBackdrop: View {
+    var body: some View {
+        ZStack {
+            LinearGradient(colors: [ArcPalette.backgroundTop, ArcPalette.background], startPoint: .top, endPoint: .bottom)
+            RadialGradient(colors: [ArcPalette.cyan.opacity(0.16), ArcPalette.cyan.opacity(0.04), .clear],
+                           center: UnitPoint(x: 0.58, y: 0.30), startRadius: 10, endRadius: 520)
+            RadialGradient(colors: [ArcPalette.amber.opacity(0.09), .clear],
+                           center: UnitPoint(x: 1.0, y: 0.95), startRadius: 0, endRadius: 420)
+            RadialGradient(colors: [.clear, Color.black.opacity(0.45)],
+                           center: .center, startRadius: 300, endRadius: 900)
+        }
+    }
+}
 
 struct MainView: View {
     @ObservedObject var store: VoiceStore
@@ -320,8 +351,7 @@ struct MainView: View {
 
     var body: some View {
         ZStack(alignment: .top) {
-            LinearGradient(colors: [ArcPalette.backgroundTop, ArcPalette.background], startPoint: .top, endPoint: .bottom)
-                .ignoresSafeArea()
+            ArcBackdrop().ignoresSafeArea()
             VStack(spacing: 0) {
                 topBar
                 HStack(spacing: 0) {
@@ -346,6 +376,7 @@ struct MainView: View {
                 .font(.system(size: 15, weight: .semibold))
                 .tracking(6)
                 .foregroundStyle(ArcPalette.text)
+                .shadow(color: ArcPalette.cyan.opacity(0.55), radius: 8)
                 .padding(.leading, 92)
             Spacer()
             let badge = store.localBadge
@@ -359,7 +390,11 @@ struct MainView: View {
             .padding(.trailing, 16)
         }
         .frame(height: 52)
-        .background(Color.black.opacity(0.18))
+        .background(Color.black.opacity(0.22))
+        .overlay(alignment: .bottom) {
+            LinearGradient(colors: [.clear, ArcPalette.cyan.opacity(0.35), .clear], startPoint: .leading, endPoint: .trailing)
+                .frame(height: 1)
+        }
     }
 }
 
@@ -388,6 +423,7 @@ struct Sidebar: View {
         }
         .padding(.top, 18).padding(.horizontal, 12)
         .frame(width: 214)
+        .background(Color.black.opacity(0.20))
     }
 
     private func item(_ section: AppSection, _ title: String, _ symbol: String) -> some View {
@@ -395,13 +431,15 @@ struct Sidebar: View {
         return Button { store.section = section } label: {
             HStack(spacing: 12) {
                 Image(systemName: symbol).frame(width: 20)
+                    .foregroundStyle(selected ? ArcPalette.cyan : ArcPalette.secondary)
                 Text(title).font(.system(size: 14, weight: selected ? .semibold : .regular))
                 Spacer()
             }
             .foregroundStyle(selected ? ArcPalette.text : ArcPalette.secondary)
             .padding(.horizontal, 14).frame(height: 44)
-            .background(RoundedRectangle(cornerRadius: 12).fill(selected ? ArcPalette.cyan.opacity(0.10) : .clear))
-            .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(selected ? ArcPalette.stroke : .clear))
+            .background(RoundedRectangle(cornerRadius: 12).fill(selected ? ArcPalette.cyan.opacity(0.13) : .clear))
+            .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(selected ? ArcPalette.cyan.opacity(0.35) : .clear))
+            .shadow(color: selected ? ArcPalette.cyan.opacity(0.25) : .clear, radius: 10)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -469,12 +507,14 @@ struct AssistantView: View {
         let text = store.machine.transcript
         if text.isEmpty {
             Text("Скажіть команду")
-                .font(.system(size: 34, weight: .regular))
-                .foregroundStyle(ArcPalette.secondary.opacity(0.45))
+                .font(.system(size: 34, weight: .light))
+                .foregroundStyle(ArcPalette.text.opacity(0.62))
+                .shadow(color: ArcPalette.cyan.opacity(0.25), radius: 14)
         } else {
             Text("«\(text)»")
                 .font(.system(size: 40, weight: .regular))
                 .foregroundStyle(store.machine.busy ? ArcPalette.text.opacity(0.45) : ArcPalette.text)
+                .shadow(color: ArcPalette.cyan.opacity(store.machine.busy ? 0 : 0.3), radius: 16)
                 .multilineTextAlignment(.center)
                 .lineLimit(3)
                 .minimumScaleFactor(0.45)
@@ -586,6 +626,9 @@ struct DiagnosticsView: View {
                 }
                 section("Розумний агент (OpenAI через Goose)") {
                     AgentSettings(store: store, actions: actions)
+                    Toggle("Швидкий мозок: прямий OpenAI з пам'яттю розмови (вимкнено — Goose)", isOn: $store.brainEnabled)
+                    Toggle("Підтверджувати дії AI у вікні плану", isOn: $store.confirmAgentActions)
+                    note("Вимкнено: дії, які пропонує AI (відкрити програму чи сайт, вікна, гучність), виконуються одразу. Диктування від AI заборонене завжди. Esc скасовує.")
                 }
                 section("Журнал розмов") {
                     Toggle("Записувати розмови локально (текст і час етапів, без аудіо)", isOn: $store.conversationLog)

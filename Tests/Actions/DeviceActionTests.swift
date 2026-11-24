@@ -34,6 +34,29 @@ import AppKit
         if case .done = await actions.perform(.windowMinimize, language: "uk") { count += 1 }
         else { fatalError("Minimize readback") }
         check(window.minimized, "Minimized actually true")
+        // Minimize all: every window that can be minimized, honest count.
+        window.minimized = false
+        let second = FakeWindow(), stubborn = FakeWindow(), already = FakeWindow()
+        stubborn.ignoreMinimize = true; already.minimized = true
+        access.others = [second, already]
+        if case .done(let summary) = await actions.perform(.windowMinimizeAll, language: "uk") {
+            check(summary == "Згорнуто вікон: 2.", "Minimize all counts only windows it changed")
+        } else { fatalError("Minimize all") }
+        check(window.minimized && second.minimized && already.writes == 0, "Already minimized window untouched")
+        window.minimized = false; second.minimized = false
+        access.others = [second, stubborn]
+        if case .partial(let summary, _) = await actions.perform(.windowMinimizeAll, language: "en") {
+            check(summary == "Minimized 2 of 3 windows.", "Partial minimize all is reported")
+        } else { fatalError("Window that ignores minimize must not report success") }
+        access.others = []; window.minimized = true
+        if case .done(let summary) = await actions.perform(.windowMinimizeAll, language: "uk") {
+            check(summary.contains("немає"), "Nothing to minimize is said plainly")
+        } else { fatalError("Empty minimize all") }
+        access.trusted = false
+        if case .failed(let reason) = await actions.perform(.windowMinimizeAll, language: "uk") {
+            check(reason.contains("Доступність"), "Minimize all needs permission")
+        } else { fatalError("Untrusted minimize all") }
+        access.trusted = true; window.minimized = false
         let audio = FakeOutput()
         let volume = AudioOutputActions(access: FakeAudioAccess(audio))
         if case .done = volume.perform(.volumeStep(10), language: "uk") { count += 1 }
@@ -90,20 +113,22 @@ import AppKit
     var frame = CGRect(x: 20, y: 20, width: 400, height: 300)
     var visibleFrame = CGRect(x: 0, y: 0, width: 1000, height: 700)
     var minimized = false
-    var allowSize = true, ignoreSize = false, throwPosition = false
+    var allowSize = true, ignoreSize = false, throwPosition = false, ignoreMinimize = false
     var writes = 0
     func canSet(_ attribute: WindowAttribute) -> Bool { attribute != .size || allowSize }
     func readFrame() throws -> CGRect { frame }
     func readMinimized() throws -> Bool { minimized }
     func setPosition(_ point: CGPoint) throws { if throwPosition { throw DeviceActionError.writeFailed }; writes += 1; frame.origin = point }
     func setSize(_ size: CGSize) throws { writes += 1; if !ignoreSize { frame.size = size } }
-    func setMinimized(_ value: Bool) throws { writes += 1; minimized = value }
+    func setMinimized(_ value: Bool) throws { writes += 1; if !ignoreMinimize { minimized = value } }
 }
 @MainActor final class FakeWindowAccess: WindowAccess {
     var trusted = true
     let window: FakeWindow
+    var others: [FakeWindow] = []
     init(_ window: FakeWindow) { self.window = window }
     func target() throws -> WindowTarget { window }
+    func allTargets() -> [WindowTarget] { [window] + others }
 }
 @MainActor final class FakeOutput: OutputTarget {
     var values: [Float] = [0.5]

@@ -36,7 +36,8 @@ enum ArcPalette {
     static let secondary = Color(red: 0.580, green: 0.682, blue: 0.722)
     static let panel = Color.white.opacity(0.035)
     static let stroke = cyan.opacity(0.16)
-    static let muted = Color(red: 0.42, green: 0.48, blue: 0.52)
+    /// Microphone off: cold steel-blue, clearly dimmer than the live cyan.
+    static let muted = Color(red: 0.36, green: 0.52, blue: 0.60)
 }
 
 struct FilamentField: View {
@@ -136,14 +137,17 @@ enum FilamentPainter {
             let color: Color
             let strength: Double
             switch mode {
-            case .off: color = ArcPalette.muted; strength = 0.35
-            case .idle: color = s.amber ? ArcPalette.amber : ArcPalette.cyan; strength = 0.55
+            case .off: color = ArcPalette.muted; strength = 0.4
+            case .idle: color = s.amber ? ArcPalette.amber : ArcPalette.cyan; strength = 0.75
             case .listening: color = s.amber ? ArcPalette.amber : ArcPalette.cyan; strength = 0.6 + Double(env) * 0.4
             case .thinking: color = s.amber ? ArcPalette.amber : ArcPalette.cyan; strength = 0.7
             }
             if mode != .off {
-                context.stroke(path, with: .color(color.opacity(0.05 * strength)), lineWidth: compact ? 5 : 9)
-                context.stroke(path, with: .color(color.opacity(0.12 * strength)), lineWidth: compact ? 2.2 : 3.5)
+                context.stroke(path, with: .color(color.opacity(0.035 * strength)), lineWidth: compact ? 9 : 18)
+                context.stroke(path, with: .color(color.opacity(0.07 * strength)), lineWidth: compact ? 5 : 9)
+                context.stroke(path, with: .color(color.opacity(0.14 * strength)), lineWidth: compact ? 2.2 : 3.5)
+            } else {
+                context.stroke(path, with: .color(color.opacity(0.06 * strength)), lineWidth: compact ? 3 : 5)
             }
             context.stroke(path, with: .color(color.opacity(0.75 * strength)), lineWidth: compact ? 0.8 : 1.0)
         }

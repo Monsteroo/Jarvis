@@ -170,7 +170,9 @@ final class JarvisApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Opt-in developer check (JARVIS_DEBUG_LEVELS=1): prints envelope numbers
     /// twice a second to stderr. Numbers only — never audio samples.
     private let debugLevels = ProcessInfo.processInfo.environment["JARVIS_DEBUG_LEVELS"] == "1"
-    /// Opt-in wake pipeline trace (JARVIS_DEBUG_WAKE=1): events and durations only, never text or audio.
+    /// Opt-in wake pipeline trace (JARVIS_DEBUG_WAKE=1): events, durations and the
+    /// first recognised word of a segment (to tune the address check); never audio
+    /// or the rest of the text.
     private let debugWake = ProcessInfo.processInfo.environment["JARVIS_DEBUG_WAKE"] == "1"
     private func wakeTrace(_ text: String) {
         guard debugWake else { return }
@@ -253,14 +255,10 @@ final class JarvisApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         registerHotKey()
         voice.onFinish = { [weak self] in self?.speechEnded() }
         voice.onCloudResult = { [weak self] in self?.cloudResult($0, characters: $1, seconds: $2) }
-        store.hasCloudKey = ProcessInfo.processInfo.environment["ELEVENLABS_API_KEY"] != nil
-            || KeychainSecret.read(KeychainSecret.elevenLabs) != nil
         store.refreshCloudUsage()
-        store.hasOpenAIKey = ProcessInfo.processInfo.environment["OPENAI_API_KEY"] != nil
-            || KeychainSecret.read(KeychainSecret.openAI) != nil
         store.agentRuntimeReady = FileManager.default.isExecutableFile(atPath: gooseExecutable.path)
             && FileManager.default.isExecutableFile(atPath: helperExecutable.path)
-        if store.hasOpenAIKey, let parts = try? agentComponents() { agentParts = parts; refreshAgentBudget() }
+        loadKeys()
         conversationLog.prune()
         store.loadVoices()
         audio.onLimit = { [weak self] in self?.finishRecording(timedOut: true) }
@@ -352,6 +350,17 @@ final class JarvisApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func runCommand(_ text: String, turn id: Int, language: String) {
         cancelCommand()
         guard !text.isEmpty else { return }
+        if brainAvailable, let name = Self.appName(in: IntentParser().parse(text, language: language)),
+           !MacContext.resolvable(name, installed: MacContext.installedApps(), running: [],
+                                  aliases: Array(AppAliases.defaults.bundleIDs.keys)) {
+            // "відкрий календар", "YouTube в Google Chrome", "антигравіті": the
+            // simple rules guessed an application name that does not exist.
+            lastCommandText = text
+            lastCommandTurn = id
+            logEvent("action", ["result": "unresolved app", "name": name, "next": "brain"])
+            runBrain(text, turn: id, language: language)
+            return
+        }
         beginRequest(turn: id, phase: .command)
         let token = dictationToken
         dictationToken = nil
@@ -384,9 +393,36 @@ final class JarvisApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var agentTask: Task<Void, Never>?
     private var approval: AgentApprovalController?
     private var cachedOpenAIKey: String?
+    /// False until the launch-time Keychain read finishes. Until then no key
+    /// is read on the main thread: a Keychain access prompt would freeze the
+    /// whole app while it waits for the owner (seen 24.11.2026 after install).
+    private var keysLoaded = false
+
+    /// Reads both API keys off the main thread, once, at launch. A missing
+    /// key is cached as "" so it is not looked up again on every request.
+    private func loadKeys() {
+        let environment = ProcessInfo.processInfo.environment
+        Task.detached(priority: .userInitiated) { [weak self] in
+            let openAI = environment["OPENAI_API_KEY"] ?? KeychainSecret.read(KeychainSecret.openAI) ?? ""
+            let eleven = environment["ELEVENLABS_API_KEY"] ?? KeychainSecret.read(KeychainSecret.elevenLabs) ?? ""
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                // A key saved from settings while the read was waiting wins.
+                if self.cachedOpenAIKey == nil { self.cachedOpenAIKey = openAI }
+                if self.cachedCloudKey == nil { self.cachedCloudKey = eleven }
+                self.keysLoaded = true
+                self.store.hasOpenAIKey = !(self.cachedOpenAIKey ?? "").isEmpty
+                self.store.hasCloudKey = !(self.cachedCloudKey ?? "").isEmpty
+                if self.store.hasOpenAIKey, self.agentParts == nil, let parts = try? self.agentComponents() {
+                    self.agentParts = parts
+                    self.refreshAgentBudget()
+                }
+            }
+        }
+    }
 
     private func openAIKey() -> String? {
-        if cachedOpenAIKey == nil {
+        if cachedOpenAIKey == nil, keysLoaded {
             cachedOpenAIKey = ProcessInfo.processInfo.environment["OPENAI_API_KEY"] ?? KeychainSecret.read(KeychainSecret.openAI)
         }
         return cachedOpenAIKey.flatMap { $0.isEmpty ? nil : $0 }
@@ -415,6 +451,169 @@ final class JarvisApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         agentTask = nil
         if let approval { MainActor.assumeIsolated { approval.dismiss() } } // also cancels the broker turn
         approval = nil
+    }
+
+    // MARK: Brain (direct OpenAI with memory; owner decision D1, 24.11.2026)
+
+    private lazy var brain = JarvisBrain(model: store.agentModel)
+    /// Turn in which the brain already said something (cancels the late acknowledgment).
+    private var brainSpokeTurn: Int?
+    private var brainFirstSpeech: Double?
+
+    private var brainAvailable: Bool { store.agentEnabled && store.brainEnabled && openAIKey() != nil }
+
+    static func appName(in action: Action?) -> String? {
+        switch action {
+        case .openApp(let name)?, .quitApp(let name)?, .activateApp(let name)?: return name
+        default: return nil
+        }
+    }
+
+    private var lastPrewarm = 0.0
+    /// Opens the TLS/HTTP2 connection while the owner is still speaking, so the
+    /// real request does not pay the handshake. Sends no key and no text.
+    private func prewarmBrain() {
+        let now = ProcessInfo.processInfo.systemUptime
+        guard brainAvailable, now - lastPrewarm > 20 else { return }
+        lastPrewarm = now
+        var request = URLRequest(url: URL(string: "https://api.openai.com/v1/models")!)
+        request.httpMethod = "HEAD"
+        URLSessionBrainTransport.session.dataTask(with: request).resume()
+    }
+
+    private func runBrain(_ text: String, turn id: Int, language: String) {
+        cancelAgent()
+        let en = language == "en"
+        guard let key = openAIKey(), let parts = try? agentComponents() else {
+            finishRequest(turn: id)
+            store.stages.action = .failed
+            store.actionMessage = en ? "The AI is not configured." : "Розумний агент не налаштований."
+            return
+        }
+        beginRequest(turn: id, phase: .agent)
+        store.stages.action = .active
+        store.stages.actionNote = "AI"
+        store.actionMessage = en ? "Thinking…" : "Думаю…"
+        brain.model = store.agentModel
+        let confirm = store.confirmAgentActions
+        let mac = MacContext.current()
+        let system = AgentPersona.brainSystem(language: language, installedApps: mac.installed)
+        let context = AgentPersona.brainContext(language: language, apps: mac.line(language: language))
+        let voiceTurn = UUID()
+        let started = ProcessInfo.processInfo.systemUptime
+        brainSpokeTurn = nil
+        brainFirstSpeech = nil
+        wakeTrace("brain start v\(AgentPersona.brainVersion)")
+        let thinking = JarvisBrain.needsThinking(text)
+        logEvent("brain_start", ["request": text, "model": store.agentModel, "prompt": AgentPersona.brainVersion,
+                                 "language": language, "memory_messages": brain.memory.turns.count, "thinking": thinking,
+                                 "front_app": mac.frontmost ?? NSNull()])
+        // Say "one moment" only if the answer is slow to start.
+        let acknowledgment: Task<Void, Never>? = store.spokenReplies ? Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            guard let self, !Task.isCancelled, self.store.machine.turn == id, self.brainSpokeTurn != id else { return }
+            self.acknowledgmentIndex += 1
+            self.speak(AgentPersona.acknowledgment(language: language, index: self.acknowledgmentIndex), language: language)
+        } : nil
+        agentTask = Task { @MainActor [weak self] in
+            defer { acknowledgment?.cancel() }
+            guard let self else { return }
+            await parts.broker.begin(turn: voiceTurn, language: language)
+            guard let reservation = try? await parts.ledger.reserve(Money(micros: 20_000)) else {
+                guard self.store.machine.turn == id else { return }
+                self.agentTask = nil
+                self.finishRequest(turn: id)
+                self.store.stages.action = .failed
+                self.store.actionMessage = en ? "The monthly AI budget is used up." : "Місячний бюджет AI вичерпано."
+                self.speak(en ? "My apologies, sir, the monthly AI budget is used up." : "Перепрошую, сер, місячний бюджет AI вичерпано.", language: language)
+                return
+            }
+            do {
+                let result = try await self.brain.respond(
+                    to: text, language: language, system: system, context: context, apiKey: key, thinking: thinking,
+                    execute: { [weak self] action in
+                        do {
+                            let plan = try await parts.broker.propose(action, turn: voiceTurn)
+                            if confirm { return .proposed }
+                            let token = try await parts.broker.approve(plan: plan.id)
+                            let outcome = try await parts.broker.commit(plan: plan.id, token: token)
+                            self?.logEvent("brain_action", ["action": "\(action)", "outcome": "\(outcome)"])
+                            return .executed(outcome)
+                        } catch {
+                            return .executed(.failed(reason: en ? "The action was cancelled." : "Дію скасовано."))
+                        }
+                    },
+                    onSentence: { [weak self] sentence in self?.brainSay(sentence, turn: id, language: language, started: started) })
+                try? await parts.ledger.settle(reservation, actual: Money(micros: result.usage.costMicros), complete: result.usageComplete)
+                guard !Task.isCancelled, self.store.machine.turn == id else { return }
+                acknowledgment?.cancel()
+                let seconds = ProcessInfo.processInfo.systemUptime - started
+                if let spoken = result.spoken { self.brainSay(spoken, turn: id, language: language, started: started) }
+                self.store.stages.action = .done
+                self.store.stages.actionNote = String(format: "AI %.1f с · $%.4f", seconds, Double(result.usage.costMicros) / 1_000_000)
+                self.store.actionMessage = String(result.reply.prefix(600))
+                self.wakeTrace(String(format: "brain ok %.1f s rounds=%d", seconds, result.rounds))
+                self.logEvent("brain", ["engine": "brain", "reply": result.reply, "spoken_after": result.spoken ?? NSNull(),
+                                        "seconds": Self.rounded(seconds), "first_text_s": Self.rounded(result.firstTextSeconds),
+                                        "first_speech_s": Self.rounded(self.brainFirstSpeech), "rounds": result.rounds,
+                                        "actions": result.actions.map { "\($0.action) → \($0.result)" },
+                                        "prompt_tokens": result.usage.prompt, "cached_tokens": result.usage.cached,
+                                        "completion_tokens": result.usage.completion,
+                                        "cost_usd": Double(result.usage.costMicros) / 1_000_000, "usage_complete": result.usageComplete])
+                self.refreshAgentBudget()
+                let plans = await parts.broker.pendingPlans().filter { $0.turn == voiceTurn }
+                guard !Task.isCancelled, self.store.machine.turn == id else { return }
+                if confirm, !plans.isEmpty {
+                    self.beginRequest(turn: id, phase: .approval)
+                    let controller = AgentApprovalController(broker: parts.broker, turn: voiceTurn, language: language,
+                        onEnd: { [weak self] in self?.finishRequest(turn: id) }) { [weak self] _, outcome in
+                        self?.agentPlanFinished(outcome, language: language)
+                    }
+                    self.approval = controller
+                    await controller.show()
+                } else {
+                    self.finishRequest(turn: id)
+                }
+                self.agentTask = nil
+            } catch {
+                try? await parts.ledger.settle(reservation, actual: nil, complete: false)
+                guard !Task.isCancelled, self.store.machine.turn == id else { return }
+                acknowledgment?.cancel()
+                self.agentTask = nil
+                self.finishRequest(turn: id)
+                self.store.stages.action = .failed
+                self.store.stages.actionNote = "AI"
+                let message = Self.brainFailure(error, language: language)
+                self.store.actionMessage = message
+                self.wakeTrace("brain failed \(error)")
+                self.logEvent("brain_error", ["error": "\(error)", "seconds": Self.rounded(ProcessInfo.processInfo.systemUptime - started)])
+                self.refreshAgentBudget()
+                self.speakAfterCurrent(message, language: language)
+            }
+        }
+    }
+
+    private func brainSay(_ text: String, turn id: Int, language: String, started: Double) {
+        guard store.machine.turn == id, !text.isEmpty else { return }
+        if brainSpokeTurn != id {
+            brainSpokeTurn = id
+            brainFirstSpeech = ProcessInfo.processInfo.systemUptime - started
+        }
+        speakAfterCurrent(text, language: language)
+    }
+
+    static func brainFailure(_ error: Error, language: String) -> String {
+        let en = language == "en"
+        switch error {
+        case BrainError.http(401, _), BrainError.http(403, _):
+            return en ? "My apologies, sir, OpenAI did not accept the key." : "Перепрошую, сер, OpenAI не прийняв ключ."
+        case BrainError.http(429, _):
+            return en ? "My apologies, sir, OpenAI is busy or the limit is reached." : "Перепрошую, сер, OpenAI перевантажений або ліміт вичерпано."
+        case is URLError:
+            return en ? "My apologies, sir, there is no connection to OpenAI." : "Перепрошую, сер, немає з'єднання з OpenAI."
+        default:
+            return en ? "My apologies, sir, the request failed." : "Перепрошую, сер, не вдалося отримати відповідь."
+        }
     }
 
     private var acknowledgmentIndex = Int.random(in: 0..<4)
@@ -470,7 +669,8 @@ final class JarvisApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             acknowledgmentIndex += 1
             speak(AgentPersona.acknowledgment(language: language, index: acknowledgmentIndex), language: language)
         }
-        let request = AgentPersona.prompt(for: text, language: language, acknowledged: acknowledged)
+        let confirmActions = store.confirmAgentActions
+        let request = AgentPersona.prompt(for: text, language: language, acknowledged: acknowledged, confirmActions: confirmActions)
         wakeTrace("agent start persona v\(AgentPersona.version)")
         logEvent("agent_start", ["request": text, "model": store.agentModel, "persona": AgentPersona.version, "language": language])
         let probe = agentProbe
@@ -494,8 +694,17 @@ final class JarvisApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 self.refreshAgentBudget()
                 let plans = await parts.broker.pendingPlans()
                 guard !Task.isCancelled, self.store.machine.turn == id, self.store.requestActivity.turn == id else { return }
+                var spoken = reply.isEmpty ? nil : AgentPersona.spokenPart(reply)
                 if plans.isEmpty {
                     self.finishRequest(turn: id)
+                } else if !confirmActions {
+                    // Owner decision 24.11.2026: no review panel. The native side still
+                    // approves and commits through the broker (one-time token); the model
+                    // has no approve/commit path. Esc cancels this task and the broker turn.
+                    let failure = await self.runPlansAtOnce(plans.filter { $0.turn == voiceTurn }, broker: parts.broker, language: language)
+                    guard !Task.isCancelled, self.store.machine.turn == id else { return }
+                    self.finishRequest(turn: id)
+                    if let failure { spoken = failure }
                 } else {
                     self.beginRequest(turn: id, phase: .approval)
                     let controller = AgentApprovalController(broker: parts.broker, turn: voiceTurn, language: language,
@@ -507,7 +716,7 @@ final class JarvisApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 }
                 guard !Task.isCancelled, self.store.machine.turn == id else { return }
                 self.agentTask = nil
-                if !reply.isEmpty { self.speakAfterCurrent(AgentPersona.spokenPart(reply), language: language) }
+                if let spoken { self.speakAfterCurrent(spoken, language: language) }
             } catch {
                 guard let self, !Task.isCancelled, self.store.machine.turn == id else { return }
                 self.agentTask = nil
@@ -523,6 +732,31 @@ final class JarvisApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 self.speakAfterCurrent(en ? "My apologies, sir, the request failed." : "Перепрошую, сер, не вдалося отримати відповідь.", language: language)
             }
         }
+    }
+
+    /// Runs AI-proposed plans in order without the review panel. Returns the
+    /// first failure to say aloud, or nil when every action succeeded.
+    private func runPlansAtOnce(_ plans: [AgentActionPlan], broker: AgentActionBroker, language: String) async -> String? {
+        var summaries: [String] = []
+        for plan in plans {
+            guard !Task.isCancelled else { return nil }
+            let outcome: CommandOutcome
+            do {
+                let token = try await broker.approve(plan: plan.id)
+                outcome = try await broker.commit(plan: plan.id, token: token)
+            } catch {
+                outcome = .failed(reason: language == "en" ? "The action was cancelled." : "Дію скасовано.")
+            }
+            logEvent("plan", ["outcome": "\(outcome)", "auto": true])
+            switch outcome {
+            case .done(let summary): summaries.append(summary)
+            case .partial(let summary, let details): store.actionMessage = summary + " " + details; return summary
+            case .failed(let reason): store.actionMessage = reason; return reason
+            default: let text = language == "en" ? "The action did not run." : "Дію не виконано."; store.actionMessage = text; return text
+            }
+        }
+        if !summaries.isEmpty { store.actionMessage += (store.actionMessage.isEmpty ? "" : "\n") + summaries.joined(separator: " ") }
+        return nil
     }
 
     private func agentPlanFinished(_ outcome: CommandOutcome, language: String) {
@@ -599,6 +833,10 @@ final class JarvisApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             store.stages.actionNote = en ? "needs approval" : "потрібне підтвердження"
             store.actionMessage = en ? "This action needs confirmation, which is not connected yet." : "Ця дія потребує підтвердження, яке ще не підключено."
             spoken = store.actionMessage
+        case .notUnderstood where brainAvailable:
+            logEvent("action", ["result": "notUnderstood", "next": "brain", "seconds": Self.rounded(seconds)])
+            runBrain(lastCommandText, turn: lastCommandTurn, language: language)
+            return
         case .notUnderstood where agentAvailable:
             logEvent("action", ["result": "notUnderstood", "next": "agent", "seconds": Self.rounded(seconds)])
             runAgent(lastCommandText, turn: lastCommandTurn, language: language)
@@ -867,6 +1105,7 @@ final class JarvisApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if store.machine.microphoneEnabled {
             cancelSession(message: "")
             // Full mic-off: wake monitoring stops too and the engine closes.
+            brain.memory.clear()
             wake.stop()
             audio.shutdown()
             resumeWakeOnWake = false
@@ -997,6 +1236,8 @@ final class JarvisApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if fromWake, let heard = raw {
                 guard let command = WakeText.command(from: heard, prefixConfirmed: prefixConfirmed) else {
                     // A KWS hint is not permission to execute a background mention.
+                    self.wakeTrace(String(format: "asr done %.2f s, rejected: no leading address, first word «%@»",
+                                          elapsed, WakeText.firstWord(heard)))
                     self.turn = nil
                     self.store.stages = TurnStages()
                     self.store.machine.abandon(turn: id, message: "")
@@ -1084,7 +1325,7 @@ final class JarvisApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Speaks a short reply with the chosen voice. Wake detection is paused
     /// for the whole reply and a short tail, so Jarvis never hears itself.
     func speak(_ text: String, language: String) {
-        queuedSpeech = nil
+        queuedSpeech.removeAll()
         guard store.spokenReplies, !store.machine.busy else { return }
         let voiceID = language == "en" ? store.voiceEN : store.voiceUK
         guard store.machine.beginSpeaking() else { return }
@@ -1099,7 +1340,7 @@ final class JarvisApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func stopSpeaking() {
-        queuedSpeech = nil
+        queuedSpeech.removeAll()
         guard store.machine.speaking else { return }
         speechToken += 1
         voice.stop()
@@ -1107,17 +1348,18 @@ final class JarvisApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         disableEscape()
     }
 
-    /// A reply that arrived while the acknowledgment was still playing.
-    private var queuedSpeech: (text: String, language: String)?
+    /// Replies that arrived while something was still being said, in order
+    /// (the acknowledgment, then the brain's streamed sentences).
+    private var queuedSpeech: [(text: String, language: String)] = []
 
-    /// Lets "Хвилинку, сер" finish before the answer starts.
+    /// Lets "Хвилинку, сер" or the previous sentence finish first.
     func speakAfterCurrent(_ text: String, language: String) {
-        if store.machine.speaking && voice.isSpeaking { queuedSpeech = (text, language) } else { speak(text, language: language) }
+        if store.machine.speaking && voice.isSpeaking { queuedSpeech.append((text, language)) } else { speak(text, language: language) }
     }
 
     private func speechEnded() {
-        if let next = queuedSpeech {
-            queuedSpeech = nil
+        if !queuedSpeech.isEmpty {
+            let next = queuedSpeech.removeFirst()
             speechToken += 1
             let voiceID = next.language == "en" ? store.voiceEN : store.voiceUK
             if store.machine.speaking { logEvent("speak", ["text": next.text, "language": next.language, "after_acknowledgment": true]) }
@@ -1142,11 +1384,12 @@ final class JarvisApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             store.cloudStatus = "ElevenLabs вимкнено перемикачем — відповідає голос macOS."
             return nil
         }
-        if cachedCloudKey == nil {
+        if cachedCloudKey == nil, keysLoaded {
             cachedCloudKey = ProcessInfo.processInfo.environment["ELEVENLABS_API_KEY"] ?? KeychainSecret.read(KeychainSecret.elevenLabs)
         }
         guard let key = cachedCloudKey, !key.isEmpty else {
-            store.cloudStatus = "Немає ключа ElevenLabs — відповідає голос macOS."
+            store.cloudStatus = keysLoaded ? "Немає ключа ElevenLabs — відповідає голос macOS."
+                : "Ключ ElevenLabs ще читається з Keychain — поки відповідає голос macOS."
             return nil
         }
         return SpeechOutput.CloudPlan(voiceID: store.elevenVoiceID, apiKey: key, monthlyCharacterLimit: store.cloudCharacterLimit)
@@ -1240,6 +1483,7 @@ final class JarvisApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func disableWake(message: String) {
+        brain.memory.clear()
         wakeActivationRequest = nil
         store.wakeLoading = false
         store.pendingWake = false
@@ -1260,6 +1504,7 @@ final class JarvisApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         case .wake(let generation, let prefixConfirmed):
             // The listener already started the command recording atomically.
             // Accept it only if this is still an idle, armed state.
+            prewarmBrain()
             wakeTrace("wake gen=\(generation) armed=\(store.machine.wakeArmed) phase=\(store.machine.phase) recGen=\(String(describing: audio.recordingGeneration))")
             // A queued event from an older capture must not stop a newer one.
             guard audio.recordingGeneration == generation else { return }
@@ -1306,9 +1551,10 @@ final class JarvisApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
             guard self.screening.isCurrent(job.ticket), self.canScreen, let heard else { return }
             let stripped = WakeText.stripLeadingWakeWord(heard)
-            self.wakeTrace(String(format: "screen %.2f s audio, asr %.2f s, keyword=%@, command chars=%d",
+            self.wakeTrace(String(format: "screen %.2f s audio, asr %.2f s, keyword=%@, command chars=%d, first word «%@»",
                                   Double(segment.samples.count) / 16_000, elapsed,
-                                  stripped.found ? "yes" : "no", stripped.found ? stripped.text.count : -1))
+                                  stripped.found ? "yes" : "no", stripped.found ? stripped.text.count : -1,
+                                  WakeText.firstWord(heard)))
             guard stripped.found else { return }
             if stripped.text.isEmpty {
                 self.wake.startCommand(after: segment.end, epoch: segment.epoch)
@@ -1320,6 +1566,7 @@ final class JarvisApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     /// The whole «Джарвіс, <команда>» phrase was already heard and recognised.
     private func presentScreenedCommand(_ text: String, segment: Segment, asrSeconds: Double) {
+        prewarmBrain()
         guard let id = store.machine.beginRecording() else { return }
         cancelCommand()
         store.actionMessage = ""
