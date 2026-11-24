@@ -62,11 +62,8 @@ extension JarvisApp {
             store.cloudStatus = "ElevenLabs вимкнено перемикачем — відповідає голос macOS."
             return nil
         }
-        if cachedCloudKey == nil, keysLoaded {
-            cachedCloudKey = ProcessInfo.processInfo.environment["ELEVENLABS_API_KEY"] ?? KeychainSecret.read(KeychainSecret.elevenLabs)
-        }
-        guard let key = cachedCloudKey, !key.isEmpty else {
-            store.cloudStatus = keysLoaded ? "Немає ключа ElevenLabs — відповідає голос macOS."
+        guard let key = keys.key(.elevenLabs) else {
+            store.cloudStatus = keys.loaded ? "Немає ключа ElevenLabs — відповідає голос macOS."
                 : "Ключ ElevenLabs ще читається з Keychain — поки відповідає голос macOS."
             return nil
         }
@@ -85,8 +82,7 @@ extension JarvisApp {
     func saveCloudKey(_ key: String) {
         let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
-        if KeychainSecret.save(trimmed, KeychainSecret.elevenLabs) {
-            cachedCloudKey = trimmed
+        if keys.save(trimmed, for: .elevenLabs) {
             voice.resetCloudPause()
             store.hasCloudKey = true
             store.cloudVoiceEnabled = true // saving a key means "use ElevenLabs"
@@ -97,9 +93,8 @@ extension JarvisApp {
     }
 
     func deleteCloudKey() {
-        KeychainSecret.delete(KeychainSecret.elevenLabs)
-        cachedCloudKey = nil
-        store.hasCloudKey = ProcessInfo.processInfo.environment["ELEVENLABS_API_KEY"] != nil
+        keys.delete(.elevenLabs)
+        store.hasCloudKey = keys.inEnvironment(.elevenLabs)
         store.cloudStatus = "Ключ видалено з Keychain."
     }
 

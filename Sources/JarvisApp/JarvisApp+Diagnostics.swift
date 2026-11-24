@@ -34,35 +34,16 @@ extension JarvisApp {
         refreshMeasurement()
     }
 
-    func currentPrompt() -> (progress: MeasurementProgress, prompt: Prompt)? {
-        guard let progress, !progress.finished, progress.index < prompts.count else { return nil }
-        return (progress, prompts[progress.index])
-    }
+    func currentPrompt() -> MeasurementSession.Current? { measurement.current }
 
     func refreshMeasurement() {
         guard store.measuring else {
             store.canSkipPrompt = false
             return
         }
-        if prompts.isEmpty {
-            let path = projectRoot + "/docs/benchmarks/prompts.txt"
-            prompts = PromptSet.parse((try? String(contentsOfFile: path, encoding: .utf8)) ?? "")
-            measurementLog = MeasurementLog(url: URL(fileURLWithPath: projectRoot + "/.runtime/measurements/uk-en-v1.jsonl"))
-        }
-        guard !prompts.isEmpty, let measurementLog else {
-            store.measurementPrompt = "Не знайдено docs/benchmarks/prompts.txt."
-            store.canSkipPrompt = false
-            return
-        }
-        progress = MeasurementProgress.next(records: measurementLog.records(), model: modelName,
-                                            languageSetting: languageCode, promptCount: prompts.count)
-        if let current = currentPrompt() {
-            store.measurementPrompt = "Прохід \(current.progress.pass)/\(MeasurementProgress.passes) · \(current.progress.index + 1)/\(prompts.count) · [\(current.prompt.language)] \(current.prompt.text)"
-            store.canSkipPrompt = true
-        } else {
-            store.measurementPrompt = "Усі \(MeasurementProgress.passes) проходи для \(modelName) / \(languageCode) записано. Запустіть scripts/analyze_measurements.py."
-            store.canSkipPrompt = false
-        }
+        let state = measurement.refresh(model: modelName, language: languageCode)
+        store.measurementPrompt = state.prompt
+        store.canSkipPrompt = state.canSkip
     }
 
     func skipPrompt() {
@@ -71,7 +52,7 @@ extension JarvisApp {
                        status: .skipped, timedOut: false, audio: 0, whisper: 0, response: 0)
     }
 
-    func logMeasurement(_ current: (progress: MeasurementProgress, prompt: Prompt), model: String, languageSetting: String,
+    func logMeasurement(_ current: MeasurementSession.Current, model: String, languageSetting: String,
                                 transcript: String, status: MeasurementRecord.Status, timedOut: Bool,
                                 audio: Double, whisper: Double, response: Double) {
         let record = MeasurementRecord(
@@ -79,7 +60,7 @@ extension JarvisApp {
             pass: current.progress.pass, promptIndex: current.progress.index, promptLanguage: current.prompt.language,
             expected: current.prompt.text, transcript: transcript, status: status, timedOut: timedOut,
             audioSeconds: audio, whisperSeconds: whisper, responseSeconds: response)
-        do { try measurementLog?.append(record) } catch {
+        do { try measurement.append(record) } catch {
             store.measurementPrompt = "Не вдалося записати вимір: \(error.localizedDescription)"
             return
         }

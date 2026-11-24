@@ -48,6 +48,25 @@ struct MeasurementTests {
         check(raw.split(separator: "\n").count == 2 && raw.contains("\"language_setting\":\"uk\""), "snake_case keys, newline-safe")
         let mode = (try FileManager.default.attributesOfItem(atPath: log.url.path)[.posixPermissions] as? NSNumber)?.intValue
         check(mode == 0o600, "log is private to the user")
+
+        // MeasurementSession: prompts and log under the project root, same strings as before.
+        let root = dir.appendingPathComponent("project")
+        try FileManager.default.createDirectory(at: root.appendingPathComponent("docs/benchmarks"), withIntermediateDirectories: true)
+        let missing = MeasurementSession(projectRoot: dir.appendingPathComponent("none").path)
+        let none = missing.refresh(model: "base", language: "uk")
+        check(none.prompt == "Не знайдено docs/benchmarks/prompts.txt." && !none.canSkip && missing.current == nil, "session without prompts")
+        try "uk|Відкрий Телеграм.\nen|Open Safari.\n".write(to: root.appendingPathComponent("docs/benchmarks/prompts.txt"), atomically: true, encoding: .utf8)
+        let session = MeasurementSession(projectRoot: root.path)
+        check(session.current == nil, "nothing is current before the first refresh")
+        var state = session.refresh(model: "base", language: "uk")
+        check(state.canSkip && state.prompt == "Прохід 1/3 · 1/2 · [uk] Відкрий Телеграм.", "first prompt: \(state.prompt)")
+        check(session.current?.prompt.text == "Відкрий Телеграм.", "current prompt")
+        for pass in 1...3 { for i in 0..<2 { try session.append(record("base", "uk", pass: pass, index: i)) } }
+        state = session.refresh(model: "base", language: "uk")
+        check(!state.canSkip && session.current == nil
+              && state.prompt == "Усі 3 проходи для base / uk записано. Запустіть scripts/analyze_measurements.py.", "finished: \(state.prompt)")
+        check(MeasurementLog(url: root.appendingPathComponent(".runtime/measurements/uk-en-v1.jsonl")).records().count == 6,
+              "session writes to the historical log path")
         print("MeasurementTests: passed")
     }
 }

@@ -10,35 +10,20 @@ extension JarvisApp {
     var gooseExecutable: URL { Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers/goose-acp") }
     var helperExecutable: URL { Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers/JarvisMCPHelper") }
 
-    /// Reads both API keys off the main thread, once, at launch. A missing
-    /// key is cached as "" so it is not looked up again on every request.
+    /// Reads both API keys off the main thread, once, at launch (APIKeyStore).
     func loadKeys() {
-        let environment = ProcessInfo.processInfo.environment
-        Task.detached(priority: .userInitiated) { [weak self] in
-            let openAI = environment["OPENAI_API_KEY"] ?? KeychainSecret.read(KeychainSecret.openAI) ?? ""
-            let eleven = environment["ELEVENLABS_API_KEY"] ?? KeychainSecret.read(KeychainSecret.elevenLabs) ?? ""
-            await MainActor.run { [weak self] in
-                guard let self else { return }
-                // A key saved from settings while the read was waiting wins.
-                if self.cachedOpenAIKey == nil { self.cachedOpenAIKey = openAI }
-                if self.cachedCloudKey == nil { self.cachedCloudKey = eleven }
-                self.keysLoaded = true
-                self.store.hasOpenAIKey = !(self.cachedOpenAIKey ?? "").isEmpty
-                self.store.hasCloudKey = !(self.cachedCloudKey ?? "").isEmpty
-                if self.store.hasOpenAIKey, self.agentParts == nil, let parts = try? self.agentComponents() {
-                    self.agentParts = parts
-                    self.refreshAgentBudget()
-                }
+        keys.load { [weak self] in
+            guard let self else { return }
+            self.store.hasOpenAIKey = self.keys.hasCachedKey(.openAI)
+            self.store.hasCloudKey = self.keys.hasCachedKey(.elevenLabs)
+            if self.store.hasOpenAIKey, self.agentParts == nil, let parts = try? self.agentComponents() {
+                self.agentParts = parts
+                self.refreshAgentBudget()
             }
         }
     }
 
-    func openAIKey() -> String? {
-        if cachedOpenAIKey == nil, keysLoaded {
-            cachedOpenAIKey = ProcessInfo.processInfo.environment["OPENAI_API_KEY"] ?? KeychainSecret.read(KeychainSecret.openAI)
-        }
-        return cachedOpenAIKey.flatMap { $0.isEmpty ? nil : $0 }
-    }
+    func openAIKey() -> String? { keys.key(.openAI) }
 
     var agentAvailable: Bool {
         store.agentEnabled && FileManager.default.isExecutableFile(atPath: gooseExecutable.path)
@@ -210,8 +195,7 @@ extension JarvisApp {
     func saveOpenAIKey(_ key: String) {
         let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
-        if KeychainSecret.save(trimmed, KeychainSecret.openAI) {
-            cachedOpenAIKey = trimmed
+        if keys.save(trimmed, for: .openAI) {
             store.hasOpenAIKey = true
             store.agentStatus = "Ключ OpenAI збережено в Keychain."
         } else {
@@ -220,9 +204,8 @@ extension JarvisApp {
     }
 
     func deleteOpenAIKey() {
-        KeychainSecret.delete(KeychainSecret.openAI)
-        cachedOpenAIKey = nil
-        store.hasOpenAIKey = ProcessInfo.processInfo.environment["OPENAI_API_KEY"] != nil
+        keys.delete(.openAI)
+        store.hasOpenAIKey = keys.inEnvironment(.openAI)
         store.agentStatus = "Ключ OpenAI видалено з Keychain."
     }
 }

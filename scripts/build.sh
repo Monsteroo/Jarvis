@@ -43,6 +43,7 @@ swiftc "${SWIFT_FLAGS[@]}" -swift-version 5 -Onone -parse-as-library Sources/Dia
 swiftc "${SWIFT_FLAGS[@]}" -swift-version 5 -Onone -parse-as-library Sources/Acknowledgment.swift Tests/AcknowledgmentTests.swift -o .build/acknowledgment-tests
 swiftc "${SWIFT_FLAGS[@]}" -swift-version 5 -Onone -parse-as-library Sources/TranscriptCleanup.swift Tests/TranscriptCleanupTests.swift -o .build/transcript-cleanup-tests
 swiftc "${SWIFT_FLAGS[@]}" -swift-version 5 -Onone -parse-as-library Sources/CloudVoice.swift Tests/CloudVoiceTests.swift -o .build/cloud-voice-tests
+swiftc "${SWIFT_FLAGS[@]}" -swift-version 5 -Onone -parse-as-library Sources/CloudVoice.swift Sources/APIKeyStore.swift Tests/APIKeyStoreTests.swift -o .build/api-key-store-tests
 swiftc "${SWIFT_FLAGS[@]}" -swift-version 5 -Onone -parse-as-library Sources/AgentPersona.swift Tests/AgentPersonaTests.swift -o .build/agent-persona-tests
 swiftc "${SWIFT_FLAGS[@]}" -swift-version 5 -Onone -parse-as-library Sources/ConversationLog.swift Tests/ConversationLogTests.swift -o .build/conversation-log-tests
 swiftc "${SWIFT_FLAGS[@]}" -swift-version 5 -Onone -parse-as-library Sources/Brain/*.swift Sources/AgentPersona.swift Sources/Actions/*.swift Sources/Agent/*.swift Tests/BrainTests.swift -framework AppKit -framework ApplicationServices -framework CoreAudio -o .build/brain-tests
@@ -51,6 +52,7 @@ bash scripts/test-actions.sh
 bash scripts/test-agent.sh
 bash scripts/test-turn-control.sh
 .build/cloud-voice-tests
+.build/api-key-store-tests
 .build/agent-persona-tests
 .build/conversation-log-tests
 .build/brain-tests
@@ -91,7 +93,7 @@ fi
 if [[ -f Sources/App.swift ]]; then
 APP="$ROOT/dist/Jarvis Voice Lab.app"
 mkdir -p "$APP/Contents/MacOS"
-swiftc "${SWIFT_FLAGS[@]}" -swift-version 5 -O -parse-as-library -import-objc-header Sources/Bridging.h Sources/App.swift Sources/LocalSpeech.swift Sources/JarvisApp/*.swift Sources/TurnControl.swift Sources/Audio.swift Sources/AudioMetrics.swift Sources/VoiceState.swift Sources/ArcRenderer.swift Sources/ArcViews.swift Sources/WakeSupport.swift Sources/WakeListener.swift Sources/Measurement.swift Sources/Diagnostic.swift Sources/Acknowledgment.swift Sources/TranscriptCleanup.swift Sources/SpeechOutput.swift Sources/AgentPersona.swift Sources/ConversationLog.swift Sources/AgentTiming.swift Sources/Brain/*.swift Sources/Actions/*.swift Sources/Actions/UI/*.swift Sources/Agent/*.swift Sources/CloudVoice.swift Sources/Parakeet.swift .build/WhisperBridge.o .build/WakeBridge.o "${LIBS[@]}" "${WAKE_LIBS[@]}" "${FRAMEWORKS[@]}" -framework AppKit -framework SwiftUI -framework AVFoundation -framework Carbon -framework ApplicationServices -framework CoreAudio -lc++ -o "$APP/Contents/MacOS/JarvisVoiceLab"
+swiftc "${SWIFT_FLAGS[@]}" -swift-version 5 -O -parse-as-library -import-objc-header Sources/Bridging.h Sources/App.swift Sources/LocalSpeech.swift Sources/JarvisApp/*.swift Sources/TurnControl.swift Sources/Audio.swift Sources/AudioMetrics.swift Sources/VoiceState.swift Sources/ArcRenderer.swift Sources/ArcViews.swift Sources/WakeSupport.swift Sources/WakeListener.swift Sources/Measurement.swift Sources/Diagnostic.swift Sources/Acknowledgment.swift Sources/TranscriptCleanup.swift Sources/SpeechOutput.swift Sources/AgentPersona.swift Sources/ConversationLog.swift Sources/AgentTiming.swift Sources/Brain/*.swift Sources/Actions/*.swift Sources/Actions/UI/*.swift Sources/Agent/*.swift Sources/CloudVoice.swift Sources/APIKeyStore.swift Sources/Parakeet.swift .build/WhisperBridge.o .build/WakeBridge.o "${LIBS[@]}" "${WAKE_LIBS[@]}" "${FRAMEWORKS[@]}" -framework AppKit -framework SwiftUI -framework AVFoundation -framework Carbon -framework ApplicationServices -framework CoreAudio -lc++ -o "$APP/Contents/MacOS/JarvisVoiceLab"
 python3 - "$APP/Contents/Info.plist" "$ROOT" <<'PY'
 import plistlib,sys
 with open(sys.argv[1],'wb') as f:

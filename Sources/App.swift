@@ -53,9 +53,7 @@ final class JarvisApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var clock: Timer?
     var started = 0.0
     var observers: [(NotificationCenter, NSObjectProtocol)] = []
-    var prompts: [Prompt] = []
-    var measurementLog: MeasurementLog?
-    var progress: MeasurementProgress?
+    lazy var measurement = MeasurementSession(projectRoot: projectRoot)
 
     var projectRoot: String {
         Bundle.main.object(forInfoDictionaryKey: "JarvisProjectRoot") as? String ?? FileManager.default.currentDirectoryPath
@@ -165,11 +163,8 @@ final class JarvisApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var agentParts: (agent: BudgetedGooseAgent, broker: AgentActionBroker, ledger: BudgetLedger, model: String)?
     var agentTask: Task<Void, Never>?
     var approval: AgentApprovalController?
-    var cachedOpenAIKey: String?
-    /// False until the launch-time Keychain read finishes. Until then no key
-    /// is read on the main thread: a Keychain access prompt would freeze the
-    /// whole app while it waits for the owner (seen 24.11.2026 after install).
-    var keysLoaded = false
+    /// OpenAI and ElevenLabs keys, read off the main thread at launch.
+    let keys = APIKeyStore()
     // Brain
     lazy var brain = JarvisBrain(model: store.agentModel)
     /// Turn in which the brain already said something (cancels the late acknowledgment).
@@ -187,7 +182,6 @@ final class JarvisApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Replies that arrived while something was still being said, in order
     /// (the acknowledgment, then the brain's streamed sentences).
     var queuedSpeech: [(text: String, language: String)] = []
-    var cachedCloudKey: String?
 
     func observe(_ center: NotificationCenter, _ name: Notification.Name, _ handler: @escaping (JarvisApp) -> Void) {
         let token = center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in

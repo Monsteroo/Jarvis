@@ -98,3 +98,44 @@ struct MeasurementProgress: Equatable {
         return MeasurementProgress(pass: passes + 1, index: 0)
     }
 }
+
+/// Measurement mode: the benchmark prompts, their log and which prompt is
+/// next. The prompts and the log load on first use; the log path and prompt
+/// file stay as they were, so historical measurements keep counting.
+final class MeasurementSession {
+    typealias Current = (progress: MeasurementProgress, prompt: Prompt)
+
+    private let promptsURL: URL
+    private let logURL: URL
+    private(set) var prompts: [Prompt] = []
+    private var log: MeasurementLog?
+    private var progress: MeasurementProgress?
+
+    init(projectRoot: String) {
+        promptsURL = URL(fileURLWithPath: projectRoot + "/docs/benchmarks/prompts.txt")
+        logURL = URL(fileURLWithPath: projectRoot + "/.runtime/measurements/uk-en-v1.jsonl")
+    }
+
+    var current: Current? {
+        guard let progress, !progress.finished, progress.index < prompts.count else { return nil }
+        return (progress, prompts[progress.index])
+    }
+
+    /// The line to show in settings and whether "skip" is possible.
+    func refresh(model: String, language: String) -> (prompt: String, canSkip: Bool) {
+        if prompts.isEmpty {
+            prompts = PromptSet.parse((try? String(contentsOf: promptsURL, encoding: .utf8)) ?? "")
+            log = MeasurementLog(url: logURL)
+        }
+        guard !prompts.isEmpty, let log else { return ("Не знайдено docs/benchmarks/prompts.txt.", false) }
+        progress = MeasurementProgress.next(records: log.records(), model: model, languageSetting: language, promptCount: prompts.count)
+        if let current {
+            return ("Прохід \(current.progress.pass)/\(MeasurementProgress.passes) · \(current.progress.index + 1)/\(prompts.count) · [\(current.prompt.language)] \(current.prompt.text)", true)
+        }
+        return ("Усі \(MeasurementProgress.passes) проходи для \(model) / \(language) записано. Запустіть scripts/analyze_measurements.py.", false)
+    }
+
+    func append(_ record: MeasurementRecord) throws {
+        try log?.append(record)
+    }
+}
