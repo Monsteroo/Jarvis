@@ -1,0 +1,112 @@
+import AppKit
+
+extension JarvisApp {
+    // MARK: Actions (ChatGPT's ActionExecutor, one instance)
+
+    /// Before the HUD appears: remember the focused text field for dictation.
+    func captureFocus() {
+        dictationToken = MainActor.assumeIsolated { try? executor.captureDictationTarget() }
+        wakeTrace("focus field=\(dictationToken != nil)") // a flag only, no app names or text
+    }
+
+    func refreshEscape() {
+        if store.canCancel { enableEscape() } else { disableEscape() }
+    }
+    func beginRequest(turn id: Int, phase: RequestActivity.Phase) {
+        store.requestActivity.begin(turn: id, phase: phase)
+        refreshEscape()
+        showHUD()
+    }
+    func finishRequest(turn id: Int) {
+        store.requestActivity.finish(turn: id)
+        refreshEscape()
+        if !store.canCancel { hideHUD(after: 3.5) }
+    }
+
+    func cancelCommand() {
+        commandTask?.cancel()
+        commandTask = nil
+        cancelAgent()
+        store.requestActivity.cancel()
+        refreshEscape()
+    }
+
+    /// Runs a recognised command through the typed executor and reports the
+    /// real outcome. A newer turn or cancel makes a late result invisible.
+    func runCommand(_ text: String, turn id: Int, language: String) {
+        cancelCommand()
+        guard !text.isEmpty else { return }
+        if brainAvailable, let name = Self.appName(in: IntentParser().parse(text, language: language)),
+           !MacContext.resolvable(name, installed: MacContext.installedApps(), running: [],
+                                  aliases: Array(AppAliases.defaults.bundleIDs.keys)) {
+            // "відкрий календар", "YouTube в Google Chrome", "антигравіті": the
+            // simple rules guessed an application name that does not exist.
+            lastCommandText = text
+            lastCommandTurn = id
+            logEvent("action", ["result": "unresolved app", "name": name, "next": "brain"])
+            runBrain(text, turn: id, language: language)
+            return
+        }
+        beginRequest(turn: id, phase: .command)
+        let token = dictationToken
+        dictationToken = nil
+        lastCommandText = text
+        lastCommandTurn = id
+        store.stages.action = .active
+        store.stages.actionNote = nil
+        let executor = self.executor
+        let started = ProcessInfo.processInfo.systemUptime
+        commandTask = Task { @MainActor [weak self] in
+            let outcome = await executor.handle(text, language: language, dictationToken: token)
+            guard let self, !Task.isCancelled, self.store.machine.turn == id, !self.store.machine.busy else { return }
+            self.commandTask = nil
+            self.present(outcome, turn: id, language: language, seconds: ProcessInfo.processInfo.systemUptime - started)
+        }
+    }
+
+    func present(_ outcome: CommandOutcome, turn id: Int, language: String, seconds: Double) {
+        let en = language == "en"
+        let spoken: String
+        switch outcome {
+        case .done(let summary):
+            store.stages.action = .done
+            store.stages.actionNote = String(format: "%.2f с", seconds)
+            store.actionMessage = summary
+            spoken = summary
+        case .partial(let summary, let details):
+            store.stages.action = .failed
+            store.stages.actionNote = en ? "partly" : "частково"
+            store.actionMessage = summary + " " + details
+            spoken = summary + " " + details
+        case .failed(let reason):
+            store.stages.action = .failed
+            store.stages.actionNote = en ? "failed" : "не виконано"
+            store.actionMessage = reason
+            spoken = reason
+        case .needsApproval:
+            // No action in the current registry asks for approval; never auto-approve.
+            store.stages.action = .failed
+            store.stages.actionNote = en ? "needs approval" : "потрібне підтвердження"
+            store.actionMessage = en ? "This action needs confirmation, which is not connected yet." : "Ця дія потребує підтвердження, яке ще не підключено."
+            spoken = store.actionMessage
+        case .notUnderstood where brainAvailable:
+            logEvent("action", ["result": "notUnderstood", "next": "brain", "seconds": Self.rounded(seconds)])
+            runBrain(lastCommandText, turn: lastCommandTurn, language: language)
+            return
+        case .notUnderstood where agentAvailable:
+            logEvent("action", ["result": "notUnderstood", "next": "agent", "seconds": Self.rounded(seconds)])
+            runAgent(lastCommandText, turn: lastCommandTurn, language: language)
+            return
+        case .notUnderstood:
+            store.stages.action = .failed
+            store.stages.actionNote = en ? "not understood" : "не зрозумів"
+            store.actionMessage = en ? "I don't know this command yet. Try “open Safari” or “volume up”."
+                                     : "Поки не знаю такої команди. Спробуйте «відкрий Safari» або «зроби гучніше»."
+            spoken = en ? "I don't know this command yet." : "Поки не знаю такої команди."
+        }
+        wakeTrace(String(format: "action %@ %.2f s", "\(outcome)".prefix(12).description, seconds))
+        logEvent("action", ["result": "\(outcome)", "message": store.actionMessage, "seconds": Self.rounded(seconds)])
+        finishRequest(turn: id)
+        speak(spoken, language: language)
+    }
+}

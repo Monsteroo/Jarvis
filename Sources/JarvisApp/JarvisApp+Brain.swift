@@ -1,0 +1,161 @@
+import AppKit
+
+extension JarvisApp {
+    // MARK: Brain (direct OpenAI with memory; owner decision D1, 24.11.2026)
+
+
+    var brainAvailable: Bool { store.agentEnabled && store.brainEnabled && openAIKey() != nil }
+
+    static func appName(in action: Action?) -> String? {
+        switch action {
+        case .openApp(let name)?, .quitApp(let name)?, .activateApp(let name)?: return name
+        default: return nil
+        }
+    }
+
+    /// Opens the TLS/HTTP2 connection while the owner is still speaking, so the
+    /// real request does not pay the handshake. Sends no key and no text.
+    func prewarmBrain() {
+        let now = ProcessInfo.processInfo.systemUptime
+        guard brainAvailable, now - lastPrewarm > 20 else { return }
+        lastPrewarm = now
+        var request = URLRequest(url: URL(string: "https://api.openai.com/v1/models")!)
+        request.httpMethod = "HEAD"
+        URLSessionBrainTransport.session.dataTask(with: request).resume()
+    }
+
+    func runBrain(_ text: String, turn id: Int, language: String) {
+        cancelAgent()
+        let en = language == "en"
+        guard let key = openAIKey(), let parts = try? agentComponents() else {
+            finishRequest(turn: id)
+            store.stages.action = .failed
+            store.actionMessage = en ? "The AI is not configured." : "Розумний агент не налаштований."
+            return
+        }
+        beginRequest(turn: id, phase: .agent)
+        store.stages.action = .active
+        store.stages.actionNote = "AI"
+        store.actionMessage = en ? "Thinking…" : "Думаю…"
+        brain.model = store.agentModel
+        let confirm = store.confirmAgentActions
+        let mac = MacContext.current()
+        let system = AgentPersona.brainSystem(language: language, installedApps: mac.installed)
+        let context = AgentPersona.brainContext(language: language, apps: mac.line(language: language))
+        let voiceTurn = UUID()
+        let started = ProcessInfo.processInfo.systemUptime
+        brainSpokeTurn = nil
+        brainFirstSpeech = nil
+        wakeTrace("brain start v\(AgentPersona.brainVersion)")
+        let thinking = JarvisBrain.needsThinking(text)
+        logEvent("brain_start", ["request": text, "model": store.agentModel, "prompt": AgentPersona.brainVersion,
+                                 "language": language, "memory_messages": brain.memory.turns.count, "thinking": thinking,
+                                 "front_app": mac.frontmost ?? NSNull()])
+        // Say "one moment" only if the answer is slow to start.
+        let acknowledgment: Task<Void, Never>? = store.spokenReplies ? Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            guard let self, !Task.isCancelled, self.store.machine.turn == id, self.brainSpokeTurn != id else { return }
+            self.acknowledgmentIndex += 1
+            self.speak(AgentPersona.acknowledgment(language: language, index: self.acknowledgmentIndex), language: language)
+        } : nil
+        agentTask = Task { @MainActor [weak self] in
+            defer { acknowledgment?.cancel() }
+            guard let self else { return }
+            await parts.broker.begin(turn: voiceTurn, language: language)
+            guard let reservation = try? await parts.ledger.reserve(Money(micros: 20_000)) else {
+                guard self.store.machine.turn == id else { return }
+                self.agentTask = nil
+                self.finishRequest(turn: id)
+                self.store.stages.action = .failed
+                self.store.actionMessage = en ? "The monthly AI budget is used up." : "Місячний бюджет AI вичерпано."
+                self.speak(en ? "My apologies, sir, the monthly AI budget is used up." : "Перепрошую, сер, місячний бюджет AI вичерпано.", language: language)
+                return
+            }
+            do {
+                let result = try await self.brain.respond(
+                    to: text, language: language, system: system, context: context, apiKey: key, thinking: thinking,
+                    execute: { [weak self] action in
+                        do {
+                            let plan = try await parts.broker.propose(action, turn: voiceTurn)
+                            if confirm { return .proposed }
+                            let token = try await parts.broker.approve(plan: plan.id)
+                            let outcome = try await parts.broker.commit(plan: plan.id, token: token)
+                            self?.logEvent("brain_action", ["action": "\(action)", "outcome": "\(outcome)"])
+                            return .executed(outcome)
+                        } catch {
+                            return .executed(.failed(reason: en ? "The action was cancelled." : "Дію скасовано."))
+                        }
+                    },
+                    onSentence: { [weak self] sentence in self?.brainSay(sentence, turn: id, language: language, started: started) })
+                try? await parts.ledger.settle(reservation, actual: Money(micros: result.usage.costMicros), complete: result.usageComplete)
+                guard !Task.isCancelled, self.store.machine.turn == id else { return }
+                acknowledgment?.cancel()
+                let seconds = ProcessInfo.processInfo.systemUptime - started
+                if let spoken = result.spoken { self.brainSay(spoken, turn: id, language: language, started: started) }
+                self.store.stages.action = .done
+                self.store.stages.actionNote = String(format: "AI %.1f с · $%.4f", seconds, Double(result.usage.costMicros) / 1_000_000)
+                self.store.actionMessage = String(result.reply.prefix(600))
+                self.wakeTrace(String(format: "brain ok %.1f s rounds=%d", seconds, result.rounds))
+                self.logEvent("brain", ["engine": "brain", "reply": result.reply, "spoken_after": result.spoken ?? NSNull(),
+                                        "seconds": Self.rounded(seconds), "first_text_s": Self.rounded(result.firstTextSeconds),
+                                        "first_speech_s": Self.rounded(self.brainFirstSpeech), "rounds": result.rounds,
+                                        "actions": result.actions.map { "\($0.action) → \($0.result)" },
+                                        "prompt_tokens": result.usage.prompt, "cached_tokens": result.usage.cached,
+                                        "completion_tokens": result.usage.completion,
+                                        "cost_usd": Double(result.usage.costMicros) / 1_000_000, "usage_complete": result.usageComplete])
+                self.refreshAgentBudget()
+                let plans = await parts.broker.pendingPlans().filter { $0.turn == voiceTurn }
+                guard !Task.isCancelled, self.store.machine.turn == id else { return }
+                if confirm, !plans.isEmpty {
+                    self.beginRequest(turn: id, phase: .approval)
+                    let controller = AgentApprovalController(broker: parts.broker, turn: voiceTurn, language: language,
+                        onEnd: { [weak self] in self?.finishRequest(turn: id) }) { [weak self] _, outcome in
+                        self?.agentPlanFinished(outcome, language: language)
+                    }
+                    self.approval = controller
+                    await controller.show()
+                } else {
+                    self.finishRequest(turn: id)
+                }
+                self.agentTask = nil
+            } catch {
+                try? await parts.ledger.settle(reservation, actual: nil, complete: false)
+                guard !Task.isCancelled, self.store.machine.turn == id else { return }
+                acknowledgment?.cancel()
+                self.agentTask = nil
+                self.finishRequest(turn: id)
+                self.store.stages.action = .failed
+                self.store.stages.actionNote = "AI"
+                let message = Self.brainFailure(error, language: language)
+                self.store.actionMessage = message
+                self.wakeTrace("brain failed \(error)")
+                self.logEvent("brain_error", ["error": "\(error)", "seconds": Self.rounded(ProcessInfo.processInfo.systemUptime - started)])
+                self.refreshAgentBudget()
+                self.speakAfterCurrent(message, language: language)
+            }
+        }
+    }
+
+    func brainSay(_ text: String, turn id: Int, language: String, started: Double) {
+        guard store.machine.turn == id, !text.isEmpty else { return }
+        if brainSpokeTurn != id {
+            brainSpokeTurn = id
+            brainFirstSpeech = ProcessInfo.processInfo.systemUptime - started
+        }
+        speakAfterCurrent(text, language: language)
+    }
+
+    static func brainFailure(_ error: Error, language: String) -> String {
+        let en = language == "en"
+        switch error {
+        case BrainError.http(401, _), BrainError.http(403, _):
+            return en ? "My apologies, sir, OpenAI did not accept the key." : "Перепрошую, сер, OpenAI не прийняв ключ."
+        case BrainError.http(429, _):
+            return en ? "My apologies, sir, OpenAI is busy or the limit is reached." : "Перепрошую, сер, OpenAI перевантажений або ліміт вичерпано."
+        case is URLError:
+            return en ? "My apologies, sir, there is no connection to OpenAI." : "Перепрошую, сер, немає з'єднання з OpenAI."
+        default:
+            return en ? "My apologies, sir, the request failed." : "Перепрошую, сер, не вдалося отримати відповідь."
+        }
+    }
+}
