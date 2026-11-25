@@ -26,7 +26,7 @@ struct ActionRegistry {
         switch action {
         case .openApp(let name), .quitApp(let name), .activateApp(let name):
             try appName(name)
-        case .tabCloseActive(let name?), .tabCloseLast(let name?), .uiSnapshot(let name?):
+        case .tabCloseActive(let name?), .tabCloseLast(let name?), .uiSnapshot(let name?), .tabNew(let name?):
             try appName(name)
         case .uiPress(let app, let snap, let ref):
             try appName(app)
@@ -37,6 +37,7 @@ struct ActionRegistry {
             try snapshotID(snap)
             try elementRef(ref)
             try text(content, max: 4000)
+        case .tabSelect(let index): guard (1...9).contains(index) else { throw ActionError.invalidParameters }
         case .openURL(let raw): _ = try WebActions.validatedURL(raw)
         case .webSearch(let query): try text(query, max: 2048)
         case .dictate(let content): try text(content, max: 16_000)
@@ -52,13 +53,21 @@ struct ActionRegistry {
         switch action {
         case .openApp, .activateApp, .quitApp, .openURL, .webSearch,
              .windowMinimize, .windowMaximize, .windowLeftHalf, .windowRightHalf, .windowMinimizeAll,
-             .tabCloseActive, .tabCloseLast, .uiSnapshot,
+             .tabCloseActive, .tabCloseLast, .tabNew, .noteNew, .mediaPlayPause, .tabSelect, .tabReopen, .tabPrevious, .tabNext,
              .volumeSet, .volumeStep, .mute, .dictate:
             return .immediate
         case .uiPress(let app, _, _):
             return UIElementSecurity.isSafeImmediatePressApp(name: app) ? .immediate : .confirmation
         case .uiSetValue:
             return .confirmation
+        case .uiSnapshot(let app):
+            // Window text goes to the cloud model: personal correspondence and data ask
+            // first. Without the live window (title) a browser or an unknown target asks;
+            // the live check is UIElementActions.effectivePolicy and perform.
+            guard let app else { return .confirmation }
+            let browser = ["google chrome", "chrome", "safari", "arc", "brave browser", "microsoft edge", "firefox"]
+                .contains(app.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
+            return browser || UIElementSecurity.snapshotNeedsConsent(name: app, bundleID: nil, windowTitle: nil) ? .confirmation : .immediate
         }
     }
 }

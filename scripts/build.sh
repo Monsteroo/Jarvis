@@ -37,6 +37,8 @@ swiftc "${SWIFT_FLAGS[@]}" -swift-version 5 -Onone -parse-as-library Sources/Aud
 .build/audio-metrics-tests
 swiftc "${SWIFT_FLAGS[@]}" -swift-version 5 -Onone -parse-as-library Sources/VoiceState.swift Tests/VoiceStateTests.swift -o .build/voice-state-tests
 .build/voice-state-tests
+swiftc "${SWIFT_FLAGS[@]}" -swift-version 5 -Onone -parse-as-library Sources/ActionStageTracker.swift Tests/ActionStageTrackerTests.swift -o .build/action-stage-tests
+.build/action-stage-tests
 swiftc "${SWIFT_FLAGS[@]}" -swift-version 5 -Onone -parse-as-library Sources/Measurement.swift Tests/MeasurementTests.swift -o .build/measurement-tests
 .build/measurement-tests
 swiftc "${SWIFT_FLAGS[@]}" -swift-version 5 -Onone -parse-as-library Sources/Diagnostic.swift Tests/DiagnosticTests.swift -o .build/diagnostic-tests
@@ -47,7 +49,7 @@ swiftc "${SWIFT_FLAGS[@]}" -swift-version 5 -Onone -parse-as-library Sources/Clo
 swiftc "${SWIFT_FLAGS[@]}" -swift-version 5 -Onone -parse-as-library Sources/AgentPersona.swift Tests/AgentPersonaTests.swift -o .build/agent-persona-tests
 swiftc "${SWIFT_FLAGS[@]}" -swift-version 5 -Onone -parse-as-library Sources/ConversationLog.swift Tests/ConversationLogTests.swift -o .build/conversation-log-tests
 swiftc "${SWIFT_FLAGS[@]}" -swift-version 5 -Onone -parse-as-library Sources/Brain/*.swift Sources/AgentPersona.swift Sources/Actions/*.swift Sources/Agent/*.swift Tests/BrainTests.swift -framework AppKit -framework ApplicationServices -framework CoreAudio -o .build/brain-tests
-# ChatGPT's action and agent modules: their own scripts and overlays.
+# Action and agent modules: their own scripts and overlays.
 bash scripts/test-actions.sh
 bash scripts/test-agent.sh
 bash scripts/test-turn-control.sh
@@ -93,7 +95,7 @@ fi
 if [[ -f Sources/App.swift ]]; then
 APP="$ROOT/dist/Jarvis Voice Lab.app"
 mkdir -p "$APP/Contents/MacOS"
-swiftc "${SWIFT_FLAGS[@]}" -swift-version 5 -O -parse-as-library -import-objc-header Sources/Bridging.h Sources/App.swift Sources/LocalSpeech.swift Sources/JarvisApp/*.swift Sources/TurnControl.swift Sources/Audio.swift Sources/AudioMetrics.swift Sources/VoiceState.swift Sources/ArcRenderer.swift Sources/ArcViews.swift Sources/WakeSupport.swift Sources/WakeListener.swift Sources/Measurement.swift Sources/Diagnostic.swift Sources/Acknowledgment.swift Sources/TranscriptCleanup.swift Sources/SpeechOutput.swift Sources/AgentPersona.swift Sources/ConversationLog.swift Sources/AgentTiming.swift Sources/Brain/*.swift Sources/Actions/*.swift Sources/Actions/UI/*.swift Sources/Agent/*.swift Sources/CloudVoice.swift Sources/APIKeyStore.swift Sources/Parakeet.swift .build/WhisperBridge.o .build/WakeBridge.o "${LIBS[@]}" "${WAKE_LIBS[@]}" "${FRAMEWORKS[@]}" -framework AppKit -framework SwiftUI -framework AVFoundation -framework Carbon -framework ApplicationServices -framework CoreAudio -lc++ -o "$APP/Contents/MacOS/JarvisVoiceLab"
+swiftc "${SWIFT_FLAGS[@]}" -swift-version 5 -O -parse-as-library -import-objc-header Sources/Bridging.h Sources/App.swift Sources/LocalSpeech.swift Sources/JarvisApp/*.swift Sources/TurnControl.swift Sources/Audio.swift Sources/AudioMetrics.swift Sources/VoiceState.swift Sources/ActionStageTracker.swift Sources/ArcRenderer.swift Sources/ArcViews.swift Sources/WakeSupport.swift Sources/WakeListener.swift Sources/Measurement.swift Sources/Diagnostic.swift Sources/Acknowledgment.swift Sources/TranscriptCleanup.swift Sources/SpeechOutput.swift Sources/AgentPersona.swift Sources/ConversationLog.swift Sources/AgentTiming.swift Sources/Brain/*.swift Sources/Actions/*.swift Sources/Actions/UI/*.swift Sources/Agent/*.swift Sources/CloudVoice.swift Sources/APIKeyStore.swift Sources/Parakeet.swift .build/WhisperBridge.o .build/WakeBridge.o "${LIBS[@]}" "${WAKE_LIBS[@]}" "${FRAMEWORKS[@]}" -framework AppKit -framework SwiftUI -framework AVFoundation -framework Carbon -framework ApplicationServices -framework CoreAudio -lc++ -o "$APP/Contents/MacOS/JarvisVoiceLab"
 python3 - "$APP/Contents/Info.plist" "$ROOT" <<'PY'
 import plistlib,sys
 with open(sys.argv[1],'wb') as f:

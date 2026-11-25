@@ -122,9 +122,9 @@
 
 ---
 
-## 6. Що потрібно для інтеграції від Codex та від Claude
+## 6. Що потрібно для інтеграції
 
-### Від Codex (`Sources/Actions/**`, `Sources/Agent/**`, відповідні тести)
+### Модулі дій і агента (`Sources/Actions/**`, `Sources/Agent/**`, відповідні тести)
 1. **`Sources/Actions/ActionModel.swift` та `ActionRegistry.swift`:**
    - Додати кейси `.tabCloseActive(app: String?)`, `.uiSnapshot(app: String?, maxNodes: Int?)`, `.uiPress(app: String, snapshotID: String, ref: String)` та `.uiSetValue(app: String, snapshotID: String, ref: String, text: String)`.
    - Реалізувати в `ActionRegistry.policy(for:)` ризик-класифікацію (білий список для `Calculator` → `.immediate`, усі зовнішні/чутливі дії та `uiSetValue` → `.confirmation`, блок списку менеджерів паролів).
@@ -136,7 +136,7 @@
    - У `AgentActionBroker` дозволити планування `uiPress`/`uiSetValue` із підстановкою зрозумілого для людини опису елемента зі збереженого знімка (щоб `AgentApprovalController.description(_:)` показував на екрані не абстрактне `e14`, а: *«Натиснути AXButton "Надіслати" у програмі Mail»*).
    - Забезпечити очищення RAM-кешу знімків у `broker.cancel(turn:)` та `broker.begin(turn:)`.
 
-### Від Claude (`Sources/Brain/**`, `Sources/JarvisApp/**` / `App.swift`, UI)
+### Мозок і застосунок (`Sources/Brain/**`, `Sources/JarvisApp/**` / `App.swift`, UI)
 1. **`Sources/Brain/JarvisBrain.swift`:**
    - Розширити `JarvisBrain.tool` новими `kind` (`tabCloseActive`, `uiSnapshot`, `uiPress`, `uiSetValue`) і повертати модельний вивід `uiSnapshot` загорнутим у `PromptFence`.
    - Дозволити пакетні `tool_calls` в одному раунді для стабільних вікон (наприклад, після одного `uiSnapshot` Калькулятора модель за один раунд передає 4 виклики `uiPress` для `2`, `+`, `2`, `=`, а в наступному раунді робить фінальний `uiSnapshot` для читання результату — це вкладається в наявні `maxRounds = 3`; для складніших UI-сценаріїв підняти ліміт до `4–5` раундів і `maxToolCalls = 6`, зберігаючи стелю бюджету в `BudgetLedger`).

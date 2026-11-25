@@ -51,6 +51,33 @@ import Foundation
     check(ledger.used(at: dec) == 0 && ledger.allows(100, limit: 100, at: dec), "new month starts at zero")
     ledger.record(10, at: dec)
     check(ledger.month == "2026-12" && ledger.characters == 10, "month rolls over")
+    // Refund goes back to the month of the reservation, never below zero.
+    // Same calendar and zone as monthKey, so the boundary is deterministic.
+    let cal = Calendar(identifier: .gregorian)
+    func at(_ y: Int, _ mo: Int, _ d: Int, _ h: Int, _ mi: Int) -> Date {
+        cal.date(from: DateComponents(year: y, month: mo, day: d, hour: h, minute: mi))!
+    }
+    var edge = VoiceUsageLedger()
+    let reservedKey = edge.reserve(50, at: at(2026, 11, 30, 23, 59))
+    check(reservedKey == "2026-11" && edge.characters == 50, "reserve returns its month")
+    edge.record(0, at: at(2026, 12, 1, 0, 1))   // another request rolls the month over
+    edge.refund(50, reservedIn: reservedKey)
+    check(edge.characters == 0 && edge.month == "2026-12", "cross-month refund leaves the new month at 0")
+    edge.record(30, at: at(2026, 12, 1, 0, 2))
+    edge.refund(50, reservedIn: reservedKey)
+    check(edge.characters == 30, "cross-month refund does not touch new usage")
+    var late = VoiceUsageLedger()
+    let lateKey = late.reserve(50, at: at(2026, 11, 30, 23, 59))
+    late.refund(50, reservedIn: lateKey)
+    check(late.characters == 0 && late.month == "2026-11", "refund before roll-over subtracts from old month")
+    var same = VoiceUsageLedger()
+    let k = same.reserve(80, at: nov)
+    same.refund(30, reservedIn: k)
+    check(same.characters == 50 && same.month == "2026-11", "same-month refund subtracts")
+    same.refund(500, reservedIn: k)
+    check(same.characters == 0, "over-refund clamps at 0")
+    var neg = VoiceUsageLedger(); neg.record(-5, at: nov)
+    check(neg.characters == 0, "record never goes negative")
     let defaults = UserDefaults(suiteName: "jarvis-cloud-test-\(UUID().uuidString)")!
     ledger.save(defaults)
     check(VoiceUsageLedger.load(defaults) == ledger, "ledger persists")

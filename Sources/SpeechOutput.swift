@@ -120,7 +120,7 @@ final class SpeechOutput: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDe
             onCloudResult?(nil, 0, 0)
             return true
         }
-        ledger.record(count, at: Date())   // counted when sent; refunded if it fails
+        let reservedMonth = ledger.reserve(count, at: Date())   // counted when sent; refunded if it fails
         ledger.save()
         let ticket = generation
         let started = ProcessInfo.processInfo.systemUptime
@@ -139,7 +139,7 @@ final class SpeechOutput: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDe
                     return
                 }
                 var refund = VoiceUsageLedger.load()
-                refund.record(-count, at: Date())
+                refund.refund(count, reservedIn: reservedMonth)
                 refund.save()
                 let code = status == 200 ? "undecodable_audio" : ElevenLabsRequest.errorCode(data)
                 let reason = ElevenLabsRequest.explain(status: status, code: code)

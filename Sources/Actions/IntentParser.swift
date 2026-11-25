@@ -26,6 +26,15 @@ struct IntentParser {
             "закрий вкладку": .tabCloseActive(nil), "закрий поточну вкладку": .tabCloseActive(nil),
             "закрий активну вкладку": .tabCloseActive(nil), "закрий цю вкладку": .tabCloseActive(nil),
             "закрий останню вкладку": .tabCloseLast(nil),
+            "нова вкладка": .tabNew(nil), "відкрий нову вкладку": .tabNew(nil), "відкрий вкладку": .tabNew(nil),
+            "перейди на останню вкладку": .tabSelect(9), "відкрий останню вкладку": .tabSelect(9),
+            "перейди на першу вкладку": .tabSelect(1), "відкрий першу вкладку": .tabSelect(1),
+            "попередня вкладка": .tabPrevious, "перемкнись на попередню вкладку": .tabPrevious, "перейди на попередню вкладку": .tabPrevious,
+            "наступна вкладка": .tabNext, "перемкнись на наступну вкладку": .tabNext, "перейди на наступну вкладку": .tabNext,
+            "поверни закриту вкладку": .tabReopen, "відкрий закриту вкладку": .tabReopen, "поверни вкладку": .tabReopen,
+            "нова нотатка": .noteNew, "створи нову нотатку": .noteNew, "створи нотатку": .noteNew,
+            "пауза": .mediaPlayPause, "постав на паузу": .mediaPlayPause, "постав відео на паузу": .mediaPlayPause,
+            "зупини відео": .mediaPlayPause, "продовж відео": .mediaPlayPause, "продовжи відео": .mediaPlayPause,
             "зроби гучніше": .volumeStep(10), "зроби тихіше": .volumeStep(-10),
             "вимкни звук": .mute(true), "увімкни звук": .mute(false)
         ] : [
@@ -35,6 +44,14 @@ struct IntentParser {
             "close tab": .tabCloseActive(nil), "close active tab": .tabCloseActive(nil),
             "close current tab": .tabCloseActive(nil), "close this tab": .tabCloseActive(nil),
             "close last tab": .tabCloseLast(nil),
+            "new tab": .tabNew(nil), "open new tab": .tabNew(nil), "open a new tab": .tabNew(nil),
+            "go to the last tab": .tabSelect(9), "switch to the last tab": .tabSelect(9), "go to the first tab": .tabSelect(1),
+            "previous tab": .tabPrevious, "go to the previous tab": .tabPrevious, "switch to the previous tab": .tabPrevious,
+            "next tab": .tabNext, "go to the next tab": .tabNext, "switch to the next tab": .tabNext,
+            "reopen closed tab": .tabReopen, "reopen the closed tab": .tabReopen, "reopen tab": .tabReopen,
+            "new note": .noteNew, "create a new note": .noteNew, "create a note": .noteNew,
+            "pause": .mediaPlayPause, "pause the video": .mediaPlayPause, "pause video": .mediaPlayPause,
+            "resume video": .mediaPlayPause, "resume the video": .mediaPlayPause,
             "volume up": .volumeStep(10), "volume down": .volumeStep(-10),
             "mute": .mute(true), "unmute": .mute(false)
         ]

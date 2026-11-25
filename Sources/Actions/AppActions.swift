@@ -78,7 +78,9 @@ struct AppAliases: Codable {
     }
     func activateApplication(_ url: URL) async throws -> Bool {
         try Task.checkCancellation()
-        guard let app = running(url).first else { return false }
+        // "Activate" an application that is not running means start it (live run
+        // 25.11.2026: activating closed Notes failed with a misleading message).
+        guard let app = running(url).first else { return try await openApplication(url) }
         guard app.activate(options: []) else { return false }
         // Activation is asynchronous; verify rather than equating acceptance with success.
         for _ in 0..<20 {

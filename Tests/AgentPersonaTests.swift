@@ -68,6 +68,23 @@ import Foundation
     let long = "Перше речення, сер. " + String(repeating: "дуже довге ", count: 30) + "друге."
     spoken(long, "Перше речення, сер.")
 
+    // Brain prompt v10–v11: a missing app that is usually a website opens as a site at once.
+    check(AgentPersona.brainVersion == 14, "brain prompt version 14")
+    check(AgentPersona.brainSystem(language: "uk", installedApps: []).contains("tabSelect лише перемикає вкладки")
+          && AgentPersona.brainSystem(language: "en", installedApps: []).contains("youtube.com/results?search_query="), "v14: page links via snapshot, video search on YouTube")
+    check(AgentPersona.brainSystem(language: "uk", installedApps: []).contains("«відкрий останню вкладку» — tabSelect 9")
+          && AgentPersona.brainSystem(language: "en", installedApps: []).contains("never closing it"), "v13: open a tab means switch, not close")
+    check(AgentPersona.brainSystem(language: "uk", installedApps: []).contains("mediaPlayPause") &&
+          AgentPersona.brainSystem(language: "en", installedApps: []).contains("a new note is noteNew"), "v12: shortcut actions instead of reading the window")
+    check(AgentPersona.brainSystem(language: "uk", installedApps: []).contains("ніколи не вигадуй домен"), "uk: no invented domains")
+    check(AgentPersona.brainSystem(language: "en", installedApps: []).contains("never invent a domain"), "en: no invented domains")
+    check(AgentPersona.brainSystem(language: "uk", installedApps: []).contains("спершу кнопку очищення"), "uk: Calculator clears first")
+    check(AgentPersona.brainSystem(language: "en", installedApps: []).contains("starting with the clear button"), "en: Calculator clears first")
+    let ukBrain = AgentPersona.brainSystem(language: "uk", installedApps: [])
+    let enBrain = AgentPersona.brainSystem(language: "en", installedApps: [])
+    check(ukBrain.contains("одразу відкрий сайт через openURL"), "uk: website fallback without asking")
+    check(enBrain.contains("open the site with openURL at once"), "en: website fallback without asking")
+
     print(failures == 0 ? "Agent persona tests passed (\(count))" : "Agent persona tests: \(failures) of \(count) failed")
     exit(failures == 0 ? 0 : 1)
  }

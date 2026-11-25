@@ -346,6 +346,10 @@ final class JarvisBrain {
             windowMinimize/windowMaximize/windowLeftHalf/windowRightHalf {} act on the front window; \
             windowMinimizeAll {} minimizes every window of every application; \
             tabCloseActive/tabCloseLast {optional target: browser name} close the active or rightmost browser tab; \
+            tabNew {optional target: browser name} opens a new browser tab; noteNew {} creates a new note in Notes; \
+            mediaPlayPause {} presses the play/pause media key (pauses or resumes a video in the browser, or music); \
+            tabSelect {value: 1…9} switches to browser tab N, 9 = the last tab; tabReopen {} reopens the last closed tab; \
+            tabPrevious {} / tabNext {} switch to the tab left / right of the current one; \
             uiSnapshot {optional target: application name} reads accessible window elements with a snapshot id and e1…eN refs; \
             uiPress {target: application name, snapshot: snapshot id, ref: eN} presses an element from a fresh uiSnapshot; \
             uiSetValue {target: application name, snapshot: snapshot id, ref: eN, text: value} writes text into a field without sending; \
@@ -358,6 +362,7 @@ final class JarvisBrain {
                         "openApp", "activateApp", "quitApp", "openURL", "webSearch",
                         "windowMinimize", "windowMaximize", "windowLeftHalf", "windowRightHalf", "windowMinimizeAll",
                         "tabCloseActive", "tabCloseLast", "uiSnapshot", "uiPress", "uiSetValue",
+                        "tabNew", "noteNew", "mediaPlayPause", "tabSelect", "tabReopen", "tabPrevious", "tabNext",
                         "volumeSet", "volumeStep", "mute"
                     ]],
                     "target": ["type": "string", "maxLength": 2048],

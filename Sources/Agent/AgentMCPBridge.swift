@@ -47,6 +47,7 @@ actor AgentMCPBridge {
                     "openApp", "activateApp", "quitApp", "openURL", "webSearch",
                     "windowMinimize", "windowMaximize", "windowLeftHalf", "windowRightHalf", "windowMinimizeAll",
                     "tabCloseActive", "tabCloseLast", "uiSnapshot", "uiPress", "uiSetValue",
+                    "tabNew", "noteNew", "mediaPlayPause", "tabSelect", "tabReopen", "tabPrevious", "tabNext",
                     "volumeSet", "volumeStep", "mute"
                 ].map(JSONValue.string))]),
                 "target": .object(["type": .string("string"), "maxLength": .number(2048)]),
@@ -66,7 +67,7 @@ actor AgentMCPBridge {
             guard let target = args["target"].string else { throw AgentError.invalidMessage }
             switch kind { case "openApp": action = .openApp(target); case "activateApp": action = .activateApp(target)
             case "quitApp": action = .quitApp(target); case "openURL": action = .openURL(target); default: action = .webSearch(target) }
-        case "tabCloseActive", "tabCloseLast", "uiSnapshot":
+        case "tabCloseActive", "tabCloseLast", "uiSnapshot", "tabNew":
             let appTarget: String?
             if keys == ["kind"] {
                 allowed = ["kind"]
@@ -79,6 +80,7 @@ actor AgentMCPBridge {
             switch kind {
             case "tabCloseActive": action = .tabCloseActive(appTarget)
             case "tabCloseLast": action = .tabCloseLast(appTarget)
+            case "tabNew": action = .tabNew(appTarget)
             default: action = .uiSnapshot(appTarget)
             }
         case "uiPress":
@@ -94,6 +96,13 @@ actor AgentMCPBridge {
                   let ref = args["ref"].string,
                   let text = args["text"].string else { throw AgentError.invalidMessage }
             action = .uiSetValue(app: target, snapshotID: snapshot, ref: ref, text: text)
+        case "tabSelect":
+            // The model sometimes names the browser; the front browser is used either way.
+            allowed = keys.contains("target") ? ["kind", "value", "target"] : ["kind", "value"]
+            guard let value = args["value"].decimal, value >= 1, value <= 9 else { throw AgentError.invalidMessage }
+            let integer = NSDecimalNumber(decimal: value).intValue
+            guard Decimal(integer) == value else { throw AgentError.invalidMessage }
+            action = .tabSelect(integer)
         case "volumeSet", "volumeStep":
             allowed = ["kind", "value"]
             guard let value = args["value"].decimal, value >= -100, value <= 100 else { throw AgentError.invalidMessage }
@@ -103,11 +112,15 @@ actor AgentMCPBridge {
         case "mute":
             allowed = ["kind", "muted"]
             guard case .bool(let muted) = args["muted"] else { throw AgentError.invalidMessage }; action = .mute(muted)
+        case "tabReopen", "tabPrevious", "tabNext":
+            allowed = keys.contains("target") ? ["kind", "target"] : ["kind"]
+            action = kind == "tabReopen" ? .tabReopen : kind == "tabPrevious" ? .tabPrevious : .tabNext
         default:
             allowed = ["kind"]
             switch kind { case "windowMinimize": action = .windowMinimize; case "windowMaximize": action = .windowMaximize
             case "windowLeftHalf": action = .windowLeftHalf; case "windowRightHalf": action = .windowRightHalf
             case "windowMinimizeAll": action = .windowMinimizeAll
+            case "noteNew": action = .noteNew; case "mediaPlayPause": action = .mediaPlayPause
             default: throw AgentError.invalidMessage }
         }
         guard keys == allowed else { throw AgentError.invalidMessage }

@@ -47,6 +47,8 @@ extension JarvisApp {
         agentTask?.cancel()
         agentTask = nil
         MainActor.assumeIsolated { executor.clearUISnapshots() }
+        if let snapshotConsent { MainActor.assumeIsolated { snapshotConsent.cancel() } }
+        snapshotConsent = nil
         if let approval { MainActor.assumeIsolated { approval.dismiss() } } // also cancels the broker turn
         approval = nil
     }
@@ -56,14 +58,13 @@ extension JarvisApp {
         let en = language == "en"
         guard let key = openAIKey(), let parts = try? agentComponents() else {
             finishRequest(turn: id)
-            store.stages.action = .failed
+            setActionStage(.failed, note: store.stages.actionNote)
             store.actionMessage = en ? "The AI agent is not configured." : "Розумний агент не налаштований."
             return
         }
         beginRequest(turn: id, phase: .agent)
         let voiceTurn = UUID()
-        store.stages.action = .active
-        store.stages.actionNote = "AI"
+        startActionStage(turn: id, language: language, ai: true)
         store.actionMessage = en ? "Thinking…" : "Думаю…"
         let context = AgentPlanningContext(broker: parts.broker, turn: voiceTurn, helperExecutable: helperExecutable)
         let started = ProcessInfo.processInfo.systemUptime
@@ -85,8 +86,8 @@ extension JarvisApp {
                 guard let self, !Task.isCancelled, self.store.machine.turn == id else { return }
                 let reply = answer.text.trimmingCharacters(in: .whitespacesAndNewlines)
                 let seconds = ProcessInfo.processInfo.systemUptime - started
-                self.store.stages.action = .done
-                self.store.stages.actionNote = answer.cost.map { String(format: "AI %.1f с · $%.4f", seconds, Double($0.micros) / 1_000_000) }
+                // The reply is ready; the action stage waits for real outcomes (below).
+                let aiNote = answer.cost.map { String(format: "AI %.1f с · $%.4f", seconds, Double($0.micros) / 1_000_000) }
                     ?? String(format: "AI %.1f с", seconds)
                 self.store.actionMessage = reply.isEmpty ? (en ? "No text answer." : "Відповіді текстом немає.") : String(reply.prefix(600))
                 self.wakeTrace(String(format: "agent ok %.1f s chars=%d", seconds, reply.count))
@@ -101,27 +102,31 @@ extension JarvisApp {
                 var spoken = reply.isEmpty ? nil : AgentPersona.spokenPart(reply)
                 let turnPlans = plans.filter { $0.turn == voiceTurn }
                 let mustConfirm = confirmActions || turnPlans.contains { self.executor.effectivePolicy(for: $0.action) == .confirmation }
+                self.updateActionStage(turn: id) {
+                    $0.replyReady(aiNote: aiNote)
+                    if !turnPlans.isEmpty { $0.expect(turnPlans.map(\.id), approval: mustConfirm) }
+                }
                 if turnPlans.isEmpty {
                     self.finishRequest(turn: id)
                 } else if !mustConfirm {
                     // Owner decision 24.11.2026: no review panel for safe immediate actions.
                     // The native side still approves and commits through the broker (one-time token);
                     // the model has no approve/commit path. Esc cancels this task and the broker turn.
-                    let failure = await self.runPlansAtOnce(turnPlans, broker: parts.broker, language: language)
+                    let failure = await self.runPlansAtOnce(turnPlans, broker: parts.broker, turn: id, language: language)
+                    self.updateActionStage(turn: id) { $0.settle() } // plans after a failure did not run
                     guard !Task.isCancelled, self.store.machine.turn == id else { return }
                     self.finishRequest(turn: id)
                     if let failure { spoken = failure }
                 } else {
-                    self.store.stages.action = .active
-                    self.store.stages.actionNote = en ? "confirm" : "підтвердження"
                     self.beginRequest(turn: id, phase: .approval)
                     let controller = AgentApprovalController(broker: parts.broker, turn: voiceTurn, language: language,
                         onEnd: { [weak self] in
                             guard let self else { return }
-                            if self.store.stages.action == .active { self.store.stages.action = .pending }
+                            // Plans with no outcome were rejected, expired or cancelled.
+                            self.updateActionStage(turn: id) { $0.settle() }
                             self.finishRequest(turn: id)
-                        }) { [weak self] _, outcome in
-                        self?.agentPlanFinished(outcome, language: language)
+                        }) { [weak self] plan, outcome in
+                        self?.agentPlanFinished(plan, outcome, turn: id, language: language)
                     }
                     self.approval = controller
                     await controller.show()
@@ -133,8 +138,7 @@ extension JarvisApp {
                 guard let self, !Task.isCancelled, self.store.machine.turn == id else { return }
                 self.agentTask = nil
                 self.finishRequest(turn: id)
-                self.store.stages.action = .failed
-                self.store.stages.actionNote = "AI"
+                self.setActionStage(.failed, note: "AI")
                 self.store.actionMessage = Self.agentFailure(error, language: language)
                 self.wakeTrace("agent failed \(error)")
                 let timing = await probe.snapshot()
@@ -148,7 +152,7 @@ extension JarvisApp {
 
     /// Runs AI-proposed plans in order without the review panel. Returns the
     /// first failure to say aloud, or nil when every action succeeded.
-    func runPlansAtOnce(_ plans: [AgentActionPlan], broker: AgentActionBroker, language: String) async -> String? {
+    func runPlansAtOnce(_ plans: [AgentActionPlan], broker: AgentActionBroker, turn id: Int, language: String) async -> String? {
         var summaries: [String] = []
         for plan in plans {
             guard !Task.isCancelled else { return nil }
@@ -159,10 +163,16 @@ extension JarvisApp {
             } catch {
                 outcome = .failed(reason: language == "en" ? "The action was cancelled." : "Дію скасовано.")
             }
-            logEvent("plan", ["outcome": "\(outcome)", "auto": true])
+            logEvent("plan", ["outcome": Self.planLogLabel(plan.action, outcome), "auto": true])
+            updateActionStage(turn: id) { $0.resolve(plan.id, Self.actionStep(outcome)) }
             switch outcome {
-            case .done(let summary): summaries.append(summary)
-            case .partial(let summary, let details): store.actionMessage = summary + " " + details; return summary
+            case .done(let summary):
+                // Window text is for the model only: never shown, spoken or logged.
+                summaries.append(Self.isSnapshot(plan.action) ? Self.snapshotReadPhrase(language: language) : summary)
+            case .partial(let summary, let details):
+                // A snapshot whose history write failed arrives as partial with the window text as summary.
+                let shown = Self.isSnapshot(plan.action) ? Self.snapshotReadPhrase(language: language) : summary
+                store.actionMessage = shown + " " + details; return shown
             case .failed(let reason): store.actionMessage = reason; return reason
             default: let text = language == "en" ? "The action did not run." : "Дію не виконано."; store.actionMessage = text; return text
             }
@@ -171,17 +181,19 @@ extension JarvisApp {
         return nil
     }
 
-    func agentPlanFinished(_ outcome: CommandOutcome, language: String) {
-        logEvent("plan", ["outcome": "\(outcome)"])
+    /// One approved plan finished (approval panel). The stage combines all plans.
+    func agentPlanFinished(_ plan: AgentActionPlan, _ outcome: CommandOutcome, turn id: Int, language: String) {
+        logEvent("plan", ["outcome": Self.planLogLabel(plan.action, outcome)])
+        updateActionStage(turn: id) { $0.resolve(plan.id, Self.actionStep(outcome)) }
         switch outcome {
         case .done(let summary):
-            store.stages.action = .done
-            store.actionMessage = summary; speak(summary, language: language)
+            // Window text is for the model only: never shown, spoken or logged.
+            let text = Self.isSnapshot(plan.action) ? Self.snapshotReadPhrase(language: language) : summary
+            store.actionMessage = text; speak(text, language: language)
         case .partial(let summary, let details):
-            store.stages.action = .failed
-            store.actionMessage = summary + " " + details; speak(summary, language: language)
+            let shown = Self.isSnapshot(plan.action) ? Self.snapshotReadPhrase(language: language) : summary
+            store.actionMessage = shown + " " + details; speak(shown, language: language)
         case .failed(let reason):
-            store.stages.action = .failed
             store.actionMessage = reason; speak(reason, language: language)
         default: break
         }

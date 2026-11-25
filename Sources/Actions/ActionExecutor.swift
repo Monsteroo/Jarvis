@@ -17,6 +17,7 @@ final class ActionExecutor: CommandHandling {
     private let workspace: ActionWorkspace
     private let windows: WindowActions?
     private let uiElements: UIElementActions?
+    private let shortcuts: ShortcutActions?
     private let audioOutput: AudioOutputActions?
     private let dictation: DictationActions?
     private let history: HistoryStore?
@@ -24,12 +25,12 @@ final class ActionExecutor: CommandHandling {
     private let registry = ActionRegistry()
     let events = ActionEvents()
 
-    init(workspace: ActionWorkspace, windows: WindowActions? = nil, uiElements: UIElementActions? = nil, audioOutput: AudioOutputActions? = nil, dictation: DictationActions? = nil, history: HistoryStore? = nil) {
-        self.workspace = workspace; self.windows = windows; self.uiElements = uiElements
+    init(workspace: ActionWorkspace, windows: WindowActions? = nil, uiElements: UIElementActions? = nil, audioOutput: AudioOutputActions? = nil, dictation: DictationActions? = nil, history: HistoryStore? = nil, shortcuts: ShortcutActions? = nil) {
+        self.workspace = workspace; self.windows = windows; self.uiElements = uiElements; self.shortcuts = shortcuts
         self.audioOutput = audioOutput; self.dictation = dictation; self.history = history
     }
     @MainActor static func live(aliases: AppAliases = .defaults, history: HistoryStore? = nil) -> ActionExecutor {
-        ActionExecutor(workspace: MacActionWorkspace(aliases: aliases), windows: WindowActions(access: MacWindowAccess()), uiElements: UIElementActions(access: MacUIElementAccess()), audioOutput: AudioOutputActions(access: MacOutputAccess()), dictation: DictationActions(access: MacDictationAccess()), history: history)
+        ActionExecutor(workspace: MacActionWorkspace(aliases: aliases), windows: WindowActions(access: MacWindowAccess()), uiElements: UIElementActions(access: MacUIElementAccess()), audioOutput: AudioOutputActions(access: MacOutputAccess()), dictation: DictationActions(access: MacDictationAccess()), history: history, shortcuts: ShortcutActions(access: MacShortcutAccess()))
     }
 
     @MainActor func captureDictationTarget() throws -> UUID {
@@ -38,6 +39,16 @@ final class ActionExecutor: CommandHandling {
     }
     @MainActor func invalidateDictationTarget() { dictation?.invalidate() }
     @MainActor func clearUISnapshots() { uiElements?.clearSnapshots() }
+    /// Reads a window after the owner allowed it on screen (any app except the blocked ones).
+    @MainActor func uiSnapshotWithOwnerConsent(_ action: Action, language: String) async -> CommandOutcome {
+        guard case .uiSnapshot = action, (try? registry.validate(action)) != nil else {
+            return .failed(reason: actionText(language, "Некоректні параметри команди.", "Invalid command parameters."))
+        }
+        guard let uiElements else {
+            return .failed(reason: actionText(language, "Керування елементами вікна не підключено.", "Window element control is not connected."))
+        }
+        return await uiElements.perform(action, language: language, ownerConsented: true)
+    }
     @MainActor func describeUIAction(_ action: Action) -> String? { uiElements?.describeTarget(for: action) }
     @MainActor func effectivePolicy(for action: Action) -> ApprovalPolicy {
         uiElements?.effectivePolicy(for: action) ?? registry.policy(for: action)
@@ -69,7 +80,10 @@ final class ActionExecutor: CommandHandling {
             result = try await execute(action, language: language, dictationToken: dictationToken)
         } catch is CancellationError { result = cancelled(language) }
         catch { result = .failed(reason: actionText(language, "Не вдалося виконати дію. Перевірте програму й повторіть спробу.", "The action failed. Check the application and try again.")) }
-        if let history {
+        // A window snapshot is read-only and its summary is the window text for the
+        // model only: a history failure must not turn it into a "partial" that is spoken.
+        let isSnapshot: Bool = { if case .uiSnapshot = action { return true }; return false }()
+        if let history, !isSnapshot {
             do { try await history.record(action: action, outcome: result, duration: ProcessInfo.processInfo.systemUptime - started) }
             catch {
                 let warning = actionText(language, "Не вдалося зберегти історію.", "History could not be saved.")
@@ -116,6 +130,9 @@ final class ActionExecutor: CommandHandling {
         case .windowMinimize, .windowMaximize, .windowLeftHalf, .windowRightHalf, .windowMinimizeAll:
             if let windows { return await windows.perform(action, language: language) }
             return .failed(reason: actionText(language, "Керування вікнами не підключено.", "Window control is not connected."))
+        case .tabNew, .noteNew, .mediaPlayPause, .tabSelect, .tabReopen, .tabPrevious, .tabNext:
+            if let shortcuts { return await shortcuts.perform(action, language: language) }
+            return .failed(reason: actionText(language, "Швидкі клавіші не підключено.", "Shortcuts are not connected."))
         case .tabCloseActive, .tabCloseLast, .uiSnapshot, .uiPress, .uiSetValue:
             if let uiElements { return await uiElements.perform(action, language: language) }
             return .failed(reason: actionText(language, "Керування елементами вікна не підключено.", "Window element control is not connected."))

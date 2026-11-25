@@ -52,7 +52,13 @@ import SwiftUI
                 let outcome = try await broker.commit(plan: plan.id, token: token)
                 guard self.valid, !Task.isCancelled else { return }
                 switch outcome {
-                case .done(let summary): self.results[plan.id] = summary
+                case .done(let summary):
+                    // Never show a raw window snapshot (text meant only for the model).
+                    if case .uiSnapshot = plan.action {
+                        self.results[plan.id] = actionText(self.language, "Вікно прочитано.", "Window read.")
+                    } else {
+                        self.results[plan.id] = summary
+                    }
                 case .partial(let summary, let details): self.results[plan.id] = summary + " " + details
                 case .failed(let reason): self.results[plan.id] = reason
                 default: self.results[plan.id] = actionText(self.language, "Дію не виконано.", "Action was not executed.")
@@ -136,6 +142,17 @@ import SwiftUI
         case .tabCloseActive(let app):
             if let app { return actionText(language, "Закрити активну вкладку: ", "Close active tab: ") + literal(app) }
             return actionText(language, "Закрити активну вкладку браузера", "Close active browser tab")
+        case .tabNew(let app):
+            if let app { return actionText(language, "Нова вкладка: ", "New tab: ") + literal(app) }
+            return actionText(language, "Нова вкладка в браузері", "New browser tab")
+        case .noteNew: return actionText(language, "Нова нотатка", "New note")
+        case .mediaPlayPause: return actionText(language, "Пауза / відтворення", "Play / pause")
+        case .tabSelect(let index):
+            return index == 9 ? actionText(language, "Перейти на останню вкладку", "Switch to the last tab")
+                : actionText(language, "Перейти на вкладку \(index)", "Switch to tab \(index)")
+        case .tabReopen: return actionText(language, "Повернути закриту вкладку", "Reopen the closed tab")
+        case .tabPrevious: return actionText(language, "Попередня вкладка", "Previous tab")
+        case .tabNext: return actionText(language, "Наступна вкладка", "Next tab")
         case .tabCloseLast(let app):
             if let app { return actionText(language, "Закрити останню вкладку: ", "Close last tab: ") + literal(app) }
             return actionText(language, "Закрити останню вкладку браузера", "Close last browser tab")

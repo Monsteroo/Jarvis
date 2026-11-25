@@ -159,10 +159,15 @@ final class JarvisApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var dictationToken: UUID?
     var lastCommandText = ""
     var lastCommandTurn = 0
+    /// Action stage of the current request; `actionStageTurn` owns it (nil: direct result).
+    var actionStage = ActionStageTracker(language: "uk")
+    var actionStageTurn: Int?
     // AI agent
     var agentParts: (agent: BudgetedGooseAgent, broker: AgentActionBroker, ledger: BudgetLedger, model: String)?
     var agentTask: Task<Void, Never>?
     var approval: AgentApprovalController?
+    /// Open "may I read this window?" question, if any (closed by Esc).
+    var snapshotConsent: SnapshotConsentPanel?
     /// OpenAI and ElevenLabs keys, read off the main thread at launch.
     let keys = APIKeyStore()
     // Brain
@@ -262,8 +267,15 @@ final class JarvisApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         hudHide = nil
         hud.orderOut(nil)
         stateSink = nil
+        // Unregister directly: disableEscape() keeps Esc while a request can still be cancelled.
+        if let escapeKey { UnregisterEventHotKey(escapeKey) }
+        escapeKey = nil
+        if let escapeChord { UnregisterEventHotKey(escapeChord) }
+        escapeChord = nil
         if let hotKey { UnregisterEventHotKey(hotKey) }
+        hotKey = nil
         if let eventHandler { RemoveEventHandler(eventHandler) }
+        eventHandler = nil
         for (center, token) in observers { center.removeObserver(token) }
         observers.removeAll()
         speech.close()

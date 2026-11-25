@@ -37,7 +37,8 @@ final class ConversationLog: @unchecked Sendable {
 
     func record(_ event: String, _ fields: [String: Any] = [:]) {
         guard enabled else { return }
-        var line = fields
+        // Mask only caller-supplied free text; the log's own ids are added after.
+        var line = Self.mask(fields) as? [String: Any] ?? [:]
         line["event"] = event
         line["session"] = session
         line["turn"] = turn
@@ -50,6 +51,50 @@ final class ConversationLog: @unchecked Sendable {
         let file = directory.appendingPathComponent(Self.day.string(from: date) + ".jsonl")
         let directory = self.directory
         queue.async { Self.append(data, to: file, directory: directory) }
+    }
+
+    static let redactionMarker = "[ключ приховано]"
+
+    private static let secretPatterns: [NSRegularExpression] = [
+        // Bearer tokens.
+        #"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{20,}"#,
+        // OpenAI-style keys (sk-, sk-proj-).
+        #"(?<![A-Za-z0-9])sk-[A-Za-z0-9_-]{20,}"#,
+        // ElevenLabs-style keys.
+        #"(?<![A-Za-z0-9])sk_[A-Za-z0-9]{20,}"#,
+        // Bare long hex strings.
+        #"(?<![A-Za-z0-9_-])[0-9a-fA-F]{32,}(?![A-Za-z0-9_-])"#,
+    ].compactMap { try? NSRegularExpression(pattern: $0) }
+    private static let longToken = try? NSRegularExpression(pattern: #"(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{32,}(?![A-Za-z0-9_-])"#)
+
+    /// Replaces key-like substrings in a string with `redactionMarker`.
+    static func maskSecrets(_ text: String) -> String {
+        var result = text
+        for regex in secretPatterns {
+            result = regex.stringByReplacingMatches(in: result, range: NSRange(result.startIndex..., in: result),
+                                                    withTemplate: NSRegularExpression.escapedTemplate(for: redactionMarker))
+        }
+        // Generic long tokens: must mix letters and digits (plain words/numbers stay).
+        if let longToken {
+            let ns = result as NSString
+            for match in longToken.matches(in: result, range: NSRange(location: 0, length: ns.length)).reversed() {
+                let token = ns.substring(with: match.range)
+                if token.contains(where: \.isLetter) && token.contains(where: \.isNumber) {
+                    result = (result as NSString).replacingCharacters(in: match.range, with: redactionMarker)
+                }
+            }
+        }
+        return result
+    }
+
+    /// Recursively masks every string inside a JSON-like value.
+    static func mask(_ value: Any) -> Any {
+        switch value {
+        case let s as String: return maskSecrets(s)
+        case let d as [String: Any]: return d.mapValues { mask($0) }
+        case let a as [Any]: return a.map { mask($0) }
+        default: return value
+        }
     }
 
     /// Waits for pending writes (tests, quitting).

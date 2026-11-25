@@ -8,6 +8,13 @@ enum Action: Equatable, Codable, Sendable {
     /// Every standard window of every other application (not Jarvis's own).
     case windowMinimizeAll
     case tabCloseActive(String?), tabCloseLast(String?)
+    /// Fixed shortcuts that need no window reading: ⌘T in a browser, ⌘N in Notes,
+    /// and the play/pause media key (a YouTube video or music).
+    case tabNew(String?), noteNew, mediaPlayPause
+    /// Switch to browser tab 1…8 (⌘1…⌘8); 9 is the last tab (⌘9). Reopen the last closed tab (⌘⇧T).
+    case tabSelect(Int), tabReopen
+    /// The tab to the left or right of the current one (⌃⇧Tab / ⌃Tab).
+    case tabPrevious, tabNext
     case uiSnapshot(String?)
     case uiPress(app: String, snapshotID: String, ref: String)
     case uiSetValue(app: String, snapshotID: String, ref: String, text: String)

@@ -24,6 +24,8 @@ extension JarvisApp {
     }
 
     func cancelCommand() {
+        // Before the panel closes: a cancelled request shows "cancelled", never running or done.
+        updateActionStage(turn: store.machine.turn) { $0.cancel() }
         commandTask?.cancel()
         commandTask = nil
         MainActor.assumeIsolated { executor.clearUISnapshots() }
@@ -53,8 +55,7 @@ extension JarvisApp {
         dictationToken = nil
         lastCommandText = text
         lastCommandTurn = id
-        store.stages.action = .active
-        store.stages.actionNote = nil
+        startActionStage(turn: id, language: language, ai: false)
         let executor = self.executor
         let started = ProcessInfo.processInfo.systemUptime
         commandTask = Task { @MainActor [weak self] in
@@ -70,24 +71,20 @@ extension JarvisApp {
         let spoken: String
         switch outcome {
         case .done(let summary):
-            store.stages.action = .done
-            store.stages.actionNote = String(format: "%.2f с", seconds)
+            setActionStage(.done, note: String(format: "%.2f с", seconds))
             store.actionMessage = summary
             spoken = summary
         case .partial(let summary, let details):
-            store.stages.action = .failed
-            store.stages.actionNote = en ? "partly" : "частково"
+            setActionStage(.failed, note: en ? "partly" : "частково")
             store.actionMessage = summary + " " + details
             spoken = summary + " " + details
         case .failed(let reason):
-            store.stages.action = .failed
-            store.stages.actionNote = en ? "failed" : "не виконано"
+            setActionStage(.failed, note: en ? "failed" : "не виконано")
             store.actionMessage = reason
             spoken = reason
         case .needsApproval:
             // No action in the current registry asks for approval; never auto-approve.
-            store.stages.action = .failed
-            store.stages.actionNote = en ? "needs approval" : "потрібне підтвердження"
+            setActionStage(.failed, note: en ? "needs approval" : "потрібне підтвердження")
             store.actionMessage = en ? "This action needs confirmation, which is not connected yet." : "Ця дія потребує підтвердження, яке ще не підключено."
             spoken = store.actionMessage
         case .notUnderstood where brainAvailable:
@@ -99,8 +96,7 @@ extension JarvisApp {
             runAgent(lastCommandText, turn: lastCommandTurn, language: language)
             return
         case .notUnderstood:
-            store.stages.action = .failed
-            store.stages.actionNote = en ? "not understood" : "не зрозумів"
+            setActionStage(.failed, note: en ? "not understood" : "не зрозумів")
             store.actionMessage = en ? "I don't know this command yet. Try “open Safari” or “volume up”."
                                      : "Поки не знаю такої команди. Спробуйте «відкрий Safari» або «зроби гучніше»."
             spoken = en ? "I don't know this command yet." : "Поки не знаю такої команди."

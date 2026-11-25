@@ -109,7 +109,21 @@ struct VoiceUsageLedger: Codable, Equatable {
 
     mutating func record(_ count: Int, at now: Date) {
         roll(now)
-        characters += count
+        characters = max(0, characters + count)
+    }
+
+    /// Reserves characters and returns the month key to hand back to `refund`.
+    @discardableResult
+    mutating func reserve(_ count: Int, at now: Date) -> String {
+        record(count, at: now)
+        return month
+    }
+
+    /// Returns characters to the month they were reserved in. If that month has
+    /// already rolled over, its count is gone and the current month is untouched.
+    mutating func refund(_ count: Int, reservedIn reservedMonth: String) {
+        guard reservedMonth == month else { return }
+        characters = max(0, characters - max(0, count))
     }
 
     static func load(_ defaults: UserDefaults = .standard) -> VoiceUsageLedger {

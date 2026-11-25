@@ -38,7 +38,30 @@ import Foundation
             check((try? registry.validate(invalid)) == nil, "Invalid rejected: \(invalid)")
         }
 
-        check(registry.policy(for: .uiSnapshot("Google Chrome")) == .immediate, "uiSnapshot is read-only immediate")
+        check(registry.policy(for: .uiSnapshot("Google Chrome")) == .confirmation, "uiSnapshot of a browser asks the owner (text goes to the cloud)")
+        check(registry.policy(for: .uiSnapshot("Calculator")) == .immediate, "uiSnapshot of Calculator is immediate")
+        check(registry.policy(for: .uiSnapshot(nil)) == .confirmation, "uiSnapshot of an unknown front window asks")
+        check(registry.policy(for: .uiSnapshot("Finder")) == .immediate, "Finder is read without asking")
+        check(registry.policy(for: .uiSnapshot("Telegram")) == .confirmation, "Telegram asks")
+
+        // Consent only for personal correspondence and data (owner decision 25.11.2026).
+        func needs(_ name: String, _ bid: String?, _ title: String?) -> Bool {
+            UIElementSecurity.snapshotNeedsConsent(name: name, bundleID: bid, windowTitle: title)
+        }
+        check(!needs("Калькулятор", "com.apple.calculator", "Калькулятор"), "Calculator: no consent")
+        check(!needs("Finder", "com.apple.finder", "Downloads"), "Finder: no consent")
+        check(!needs("System Settings", "com.apple.systempreferences", "Wi-Fi"), "System Settings: no consent")
+        check(!needs("Google Chrome", "com.google.chrome", "YouTube - Google Chrome"), "YouTube page: no consent")
+        check(!needs("Google Chrome", "com.google.chrome", "Feed | LinkedIn"), "LinkedIn feed: no consent")
+        check(needs("Google Chrome", "com.google.chrome", "Inbox (3) - owner@example.com - Gmail"), "Gmail page asks")
+        check(needs("Google Chrome", "com.google.chrome", "Messaging | LinkedIn"), "LinkedIn messages ask")
+        check(needs("Safari", "com.apple.Safari", "Telegram Web"), "web Telegram asks")
+        check(needs("Google Chrome", "com.google.chrome", "Приват24 — вхід"), "bank page asks")
+        check(needs("Google Chrome", "com.google.chrome", nil), "browser without a title asks")
+        check(needs("Telegram", "ru.keepcoder.Telegram", "Telegram"), "Telegram app asks")
+        check(needs("Messages", "com.apple.MobileSMS", "Messages"), "Messages asks")
+        check(needs("Mail", "com.apple.mail", "Inbox"), "Mail asks")
+        check(needs("Нотатки", "com.apple.Notes", "Нотатки"), "Notes asks")
         check(registry.policy(for: .tabCloseActive(nil)) == .immediate, "tabCloseActive immediate")
         check(registry.policy(for: .uiPress(app: "Calculator", snapshotID: "abcd1234", ref: "e2")) == .immediate, "Calculator allowlisted")
         check(registry.policy(for: .uiPress(app: "Google Chrome", snapshotID: "abcd1234", ref: "e2")) == .confirmation, "Browser press needs confirmation")
@@ -67,7 +90,32 @@ import Foundation
         // Effective policy checks live snapshot label: safe button in Calculator -> immediate;
         // high-risk label ("Delete") even inside Calculator -> confirmation!
         check(ui.effectivePolicy(for: .uiPress(app: "Calculator", snapshotID: "snap0001", ref: "e2")) == .immediate, "Digit 2 immediate")
+        check(ui.effectivePolicy(for: .uiSnapshot("Calculator")) == .immediate && ui.effectivePolicy(for: .uiSnapshot(nil)) == .immediate,
+              "Calculator snapshot needs no consent")
         check(ui.effectivePolicy(for: .uiPress(app: "Calculator", snapshotID: "snap0001", ref: "e6")) == .confirmation, "Delete label forces confirmation")
+        // Browser snapshots keep only the page: links, not the tab strip.
+        let page = UINodeRecord(path: [0, 1], role: "AXWebArea", subrole: nil, title: "YouTube", descriptionText: nil, value: nil, identifier: nil, enabled: true, settableValue: false, actions: [], children: [
+            UINodeRecord(path: [0, 1, 0], role: "AXGroup", subrole: nil, title: nil, descriptionText: nil, value: nil, identifier: nil, enabled: true, settableValue: false, actions: []),
+            UINodeRecord(path: [0, 1, 1], role: "AXLink", subrole: nil, title: "First video", descriptionText: nil, value: nil, identifier: nil, enabled: true, settableValue: false, actions: ["AXPress"]),
+        ])
+        let browserWindow = UINodeRecord(path: [], role: "AXWindow", subrole: "AXStandardWindow", title: "YouTube", descriptionText: nil, value: nil, identifier: nil, enabled: true, settableValue: false, actions: [], children: [
+            UINodeRecord(path: [0], role: "AXGroup", subrole: nil, title: nil, descriptionText: nil, value: nil, identifier: nil, enabled: true, settableValue: false, actions: [], children: [
+                UINodeRecord(path: [0, 0], role: "AXRadioButton", subrole: "AXTabButton", title: "YouTube tab", descriptionText: nil, value: nil, identifier: nil, enabled: true, settableValue: false, actions: ["AXPress"]),
+                page,
+            ]),
+        ])
+        check(UISnapshotBuilder.webRoot(in: browserWindow) == page, "web root found")
+        let webRecord = UISnapshotBuilder.build(root: page, appName: "Google Chrome", bundleID: "com.google.chrome", pid: 1, windowTitle: "YouTube",
+                                                snapshotID: "web00001", createdUptime: 0, interactiveOnly: true)
+        check(webRecord.entries.map(\.label) == ["First video"] && webRecord.entries.first?.path == [0, 1, 1],
+              "page snapshot lists the link with its absolute path, no tab strip or empty group")
+
+        // Presses run at once in any app; only risky labels ask (owner decision 25.11.2026).
+        check(!UIElementSecurity.hasHighRiskLabel("Нова нотатка") && !UIElementSecurity.hasHighRiskLabel("Rick Astley - Never Gonna Give You Up"),
+              "ordinary buttons and video links are not risky")
+        for risky in ["Надіслати", "Send", "Like", "Подобається", "Підписатися", "Delete", "Купити", "Repost", "Call"] {
+            check(UIElementSecurity.hasHighRiskLabel(risky), "risky label: \(risky)")
+        }
         check(ui.describeTarget(for: .uiPress(app: "Calculator", snapshotID: "snap0001", ref: "e2")) == "Калькулятор: AXButton «2»", "Human target description")
 
         // Press 2, +, 2, =
@@ -100,7 +148,13 @@ import Foundation
         }
 
         fake.configureNotesWindow()
-        let notesSnap = await ui.perform(.uiSnapshot("Notes"), language: "uk")
+        check(ui.effectivePolicy(for: .uiSnapshot("Notes")) == .confirmation, "Notes snapshot needs consent")
+        check(ui.effectivePolicy(for: .uiSnapshot(nil)) == .confirmation, "front Notes window needs consent")
+        check(ui.describeTarget(for: .uiSnapshot(nil)) == "Notes", "consent names the window's app")
+        let unconsented = await ui.perform(.uiSnapshot("Notes"), language: "uk")
+        check(unconsented == .failed(reason: "Читати вікно цієї програми можна лише з дозволу власника на екрані."),
+              "Notes is not read without consent: \(unconsented)")
+        let notesSnap = await ui.perform(.uiSnapshot("Notes"), language: "uk", ownerConsented: true)
         guard case .done = notesSnap else { fatalError("Notes snapshot failed") }
         let snapID = String(format: "snap%04d", nextID)
 
@@ -191,6 +245,11 @@ import Foundation
                 UINodeRecord(path: [1], role: "AXTextField", subrole: nil, title: "Card CVV", descriptionText: "Security code", value: "", identifier: "cvv", enabled: true, settableValue: true, actions: []),
             ]
         )
+    }
+
+    func snapshotTarget(appQuery: String?) -> (name: String, bundleID: String?, windowTitle: String?)? {
+        if notesMode || appQuery == "Notes" { return ("Notes", "com.apple.Notes", "Notes") }
+        return ("Калькулятор", "com.apple.calculator", "Калькулятор")
     }
 
     func captureWindow(appQuery: String?, maxDepth: Int, maxVisited: Int) throws -> UIWindowSnapshotSource {

@@ -194,6 +194,10 @@ enum UIElementSecurity {
         "buy", "pay", "checkout", "purchase", "order", "transfer", "confirm payment",
         "надіслати", "відправити", "опублікувати", "видалити", "очистити кошик", "стерти",
         "купити", "оплатити", "замовити", "переказати",
+        // Public or social actions done in the owner's name.
+        "post", "like", "follow", "repost", "share", "comment", "call", "accept",
+        "подобається", "вподобати", "лайк", "підписатися", "поширити", "поділитися", "коментувати",
+        "подзвонити", "дзвінок", "прийняти",
     ]
 
     private static let paymentOrSecretFieldTokens: [String] = [
@@ -209,6 +213,60 @@ enum UIElementSecurity {
             if blockedBundlePrefixes.contains(where: { bid.hasPrefix($0) }) { return true }
         }
         return false
+    }
+
+    /// Apps whose windows hold personal correspondence or personal data. Reading
+    /// them sends that text to the cloud model, so the owner allows it on screen
+    /// first (owner decision 25.11.2026: ask only for sensitive windows).
+    private static let sensitiveBundlePrefixes: [String] = [
+        "com.apple.mail", "com.apple.mobilesms", "com.apple.ichat", "com.apple.notes",
+        "com.apple.addressbook", "com.apple.ical", "com.apple.reminders", "com.apple.photos",
+        "com.apple.facetime", "com.apple.health", "com.apple.wallet", "com.apple.stocks",
+        "ru.keepcoder.telegram", "org.telegram", "net.whatsapp", "desktop.whatsapp", "org.whispersystems.signal",
+        "com.viber", "com.tinyspeck.slackmacgap", "com.hnc.discord", "com.microsoft.teams",
+        "com.microsoft.outlook", "com.readdle.smartemail", "com.facebook.archon", "us.zoom",
+        "com.skype", "org.mozilla.thunderbird", "com.superhuman", "com.microsoft.onenote",
+        "md.obsidian", "notion.id", "com.evernote", "com.apple.iwork.pages", "com.microsoft.word",
+    ]
+
+    private static let sensitiveAppNames: Set<String> = [
+        "mail", "пошта", "messages", "повідомлення", "notes", "нотатки", "contacts", "контакти",
+        "calendar", "календар", "reminders", "нагадування", "photos", "фотографії", "facetime",
+        "telegram", "телеграм", "whatsapp", "signal", "viber", "slack", "discord", "microsoft teams",
+        "outlook", "spark", "messenger", "zoom", "skype", "thunderbird", "obsidian", "notion", "evernote",
+        "pages", "microsoft word", "onenote",
+    ]
+
+    /// Browser windows are sensitive only when the page itself is: mail, chats,
+    /// banking, personal documents (decided from the window title).
+    private static let sensitiveTitleTokens: [String] = [
+        "gmail", "inbox", "вхідні", "outlook", "mail", "пошта", "telegram", "whatsapp", "messenger",
+        "messages", "повідомлення", "messaging", "direct", "signal", "viber", "slack", "discord",
+        "teams", "bank", "банк", "privat24", "приват24", "monobank", "paypal", "wise", "revolut",
+        "icloud", "google docs", "google drive", "docs.google", "drive", "документ", "notion",
+    ]
+
+    static let browserBundles: Set<String> = [
+        "com.google.chrome", "com.apple.safari", "company.thebrowser.browser",
+        "com.brave.browser", "com.microsoft.edgemac", "org.mozilla.firefox",
+    ]
+
+    /// Whether reading this window needs the owner's consent on screen: personal
+    /// correspondence and personal data (and an unknown target) do; ordinary
+    /// windows (Calculator, Finder, System Settings, a news page) do not.
+    static func snapshotNeedsConsent(name: String, bundleID: String?, windowTitle: String?) -> Bool {
+        let lowerName = name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let bid = bundleID?.lowercased() ?? ""
+        if !bid.isEmpty, sensitiveBundlePrefixes.contains(where: { bid.hasPrefix($0) }) { return true }
+        if sensitiveAppNames.contains(lowerName) { return true }
+        let isBrowser = browserBundles.contains(bid)
+            || ["google chrome", "chrome", "safari", "arc", "brave browser", "microsoft edge", "firefox"].contains(lowerName)
+        guard isBrowser else { return false }
+        guard let title = windowTitle?.lowercased(), !title.isEmpty else { return true }
+        let words = Set(title.split(whereSeparator: { !$0.isLetter && !$0.isNumber && $0 != "." }).map(String.init))
+        return sensitiveTitleTokens.contains { token in
+            token.contains(" ") || token.contains(".") ? title.contains(token) : words.contains(token)
+        }
     }
 
     static func isSafeImmediatePressApp(name: String, bundleID: String? = nil) -> Bool {
@@ -249,8 +307,21 @@ enum UISnapshotBuilder {
         "AXStaticText", "AXImage", "AXHeading",
     ]
 
-    static func shouldEmit(_ node: UINodeRecord, label: String) -> Bool {
+    /// The page content of a browser window (its first AXWebArea), so a snapshot
+    /// lists the page's links instead of the tab strip and toolbar. Paths stay
+    /// absolute from the window. Nil when the window has no web area.
+    static func webRoot(in root: UINodeRecord) -> UINodeRecord? {
+        if root.role == "AXWebArea" { return root }
+        for child in root.children { if let found = webRoot(in: child) { return found } }
+        return nil
+    }
+
+    static func shouldEmit(_ node: UINodeRecord, label: String, interactiveOnly: Bool = false) -> Bool {
         if node.isSecure { return true }
+        if interactiveOnly {
+            // Web pages: only what can be pressed or typed into, plus headings for orientation.
+            return node.isPressable || (node.settableValue && node.enabled) || (node.role == "AXHeading" && !label.isEmpty)
+        }
         if node.isPressable || (node.settableValue && node.enabled) { return true }
         if !label.isEmpty {
             if (node.role == "AXGroup" || node.role == "AXWebArea") && !node.children.isEmpty
@@ -274,7 +345,8 @@ enum UISnapshotBuilder {
         ttlSeconds: TimeInterval = 120,
         maxNodes: Int = 100,
         maxDepth: Int = 14,
-        maxRawVisited: Int = 2000
+        maxRawVisited: Int = 2000,
+        interactiveOnly: Bool = false
     ) -> UISnapshotRecord {
         var entries: [UISnapshotEntry] = []
         var visited = 0
@@ -293,7 +365,7 @@ enum UISnapshotBuilder {
 
             if depth > 0 {
                 let label = UISnapshotText.summarize(node, maxChars: 80)
-                if shouldEmit(node, label: label) {
+                if shouldEmit(node, label: label, interactiveOnly: interactiveOnly) {
                     let ref = "e\(entries.count + 1)"
                     entries.append(
                         UISnapshotEntry(
@@ -404,6 +476,8 @@ enum UIElementError: Error, Equatable {
     case notWritable
     case forbiddenField
     case actionFailed
+    /// Reading this window needs the owner's consent on screen: its text would go to the cloud model.
+    case needsOwnerConsent
 }
 
 @MainActor protocol UIElementAccess {
@@ -413,6 +487,8 @@ enum UIElementError: Error, Equatable {
     func readNode(pid: pid_t, path: [Int]) throws -> UINodeRecord
     func writeValue(pid: pid_t, path: [Int], text: String) throws -> String?
     func closeTab(appQuery: String?, mode: TabCloseMode) throws -> String
+    /// Which application a snapshot would read, without reading the window.
+    func snapshotTarget(appQuery: String?) -> (name: String, bundleID: String?, windowTitle: String?)?
 }
 
 @MainActor final class UIElementActions {
@@ -452,6 +528,8 @@ enum UIElementError: Error, Equatable {
             }
             let shown = entry.label.isEmpty ? entry.displayRole : "\(entry.displayRole) «\(entry.label)»"
             return "\(rec.appName): \(shown)"
+        case .uiSnapshot(let app):
+            return access.snapshotTarget(appQuery: app)?.name ?? app
         default:
             return nil
         }
@@ -462,22 +540,25 @@ enum UIElementError: Error, Equatable {
         switch action {
         case .uiSetValue:
             return .confirmation
-        case .uiPress(let app, let snapshotID, let ref):
-            if let (rec, entry) = store.entry(snapshotID: snapshotID, ref: ref, now: now) {
-                guard UIElementSecurity.isSafeImmediatePressApp(name: rec.appName, bundleID: rec.bundleID),
-                      UIElementSecurity.isSafeImmediatePressApp(name: app, bundleID: rec.bundleID),
-                      !UIElementSecurity.hasHighRiskLabel(entry.label, identifier: entry.identifier) else {
-                    return .confirmation
-                }
-                return .immediate
+        case .uiSnapshot(let app):
+            guard let target = access.snapshotTarget(appQuery: app),
+                  !UIElementSecurity.snapshotNeedsConsent(name: target.name, bundleID: target.bundleID, windowTitle: target.windowTitle) else {
+                return .confirmation
             }
-            return UIElementSecurity.isSafeImmediatePressApp(name: app) ? .immediate : .confirmation
+            return .immediate
+        case .uiPress(_, let snapshotID, let ref):
+            // Owner decision 25.11.2026: presses run at once in any app; only
+            // risky ones (send, delete, buy, publish, like, call…) wait for the owner.
+            guard let (_, entry) = store.entry(snapshotID: snapshotID, ref: ref, now: now) else { return .confirmation }
+            return UIElementSecurity.hasHighRiskLabel(entry.label, identifier: entry.identifier) ? .confirmation : .immediate
         default:
             return ActionRegistry().policy(for: action)
         }
     }
 
-    func perform(_ action: Action, language: String) async -> CommandOutcome {
+    /// `ownerConsented` is set only by the app after the owner allowed reading
+    /// this window on screen; without it a snapshot reads allowlisted apps only.
+    func perform(_ action: Action, language: String, ownerConsented: Bool = false) async -> CommandOutcome {
         guard !Task.isCancelled else {
             return .failed(reason: actionText(language, "Запит скасовано.", "Request cancelled."))
         }
@@ -506,19 +587,33 @@ enum UIElementError: Error, Equatable {
                     throw UIElementError.blockedSensitiveApp
                 }
                 try Task.checkCancellation()
-                let source = try access.captureWindow(appQuery: app, maxDepth: 14, maxVisited: 2000)
+                // Web pages are deep: read further, then keep only the page content.
+                let targetBundle = access.snapshotTarget(appQuery: app)?.bundleID?.lowercased() ?? ""
+                let deep = UIElementSecurity.browserBundles.contains(targetBundle)
+                let source = try access.captureWindow(appQuery: app, maxDepth: deep ? 40 : 14, maxVisited: deep ? 4000 : 2000)
+                let web = UIElementSecurity.browserBundles.contains((source.bundleID ?? "").lowercased())
+                    ? UISnapshotBuilder.webRoot(in: source.root) : nil
                 if UIElementSecurity.isBlockedSensitiveApp(name: source.appName, bundleID: source.bundleID) {
                     throw UIElementError.blockedSensitiveApp
                 }
+                // Checked on the window actually read, not on the requested name:
+                // the front app may have changed since the policy was decided.
+                guard ownerConsented || !UIElementSecurity.snapshotNeedsConsent(name: source.appName, bundleID: source.bundleID, windowTitle: source.windowTitle) else {
+                    throw UIElementError.needsOwnerConsent
+                }
                 let now = uptime()
                 let record = UISnapshotBuilder.build(
-                    root: source.root,
+                    root: web ?? source.root,
                     appName: source.appName,
                     bundleID: source.bundleID,
                     pid: source.pid,
                     windowTitle: source.windowTitle,
                     snapshotID: makeID(),
-                    createdUptime: now
+                    createdUptime: now,
+                    maxNodes: web == nil ? 100 : 150,
+                    maxDepth: web == nil ? 14 : 40,
+                    maxRawVisited: web == nil ? 2000 : 4000,
+                    interactiveOnly: web != nil
                 )
                 store.save(record, now: now)
                 return .done(summary: record.fencedText())
@@ -678,6 +773,9 @@ enum UIElementError: Error, Equatable {
             )
         case .actionFailed:
             return actionText(language, "Програма відхилила дію з елементом інтерфейсу.", "The application rejected the interface element action.")
+        case .needsOwnerConsent:
+            return actionText(language, "Читати вікно цієї програми можна лише з дозволу власника на екрані.",
+                              "Reading this application's window needs the owner's permission on screen.")
         }
     }
 }
@@ -722,6 +820,12 @@ enum UIElementError: Error, Equatable {
     ]
 
     var trusted: Bool { AXIsProcessTrusted() }
+
+    func snapshotTarget(appQuery: String?) -> (name: String, bundleID: String?, windowTitle: String?)? {
+        guard let app = try? Self.resolveApplication(query: appQuery, requireBrowser: false) else { return nil }
+        let title = (try? Self.resolveWindow(for: app))?.2
+        return (app.localizedName ?? (appQuery ?? ""), app.bundleIdentifier, title)
+    }
 
     func captureWindow(appQuery: String?, maxDepth: Int, maxVisited: Int) throws -> UIWindowSnapshotSource {
         guard trusted else { throw UIElementError.untrusted }

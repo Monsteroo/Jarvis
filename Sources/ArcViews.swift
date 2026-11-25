@@ -5,8 +5,6 @@ enum AppSection: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 }
 
-enum StageState: Equatable { case pending, active, done, failed }
-
 /// Real per-turn pipeline stages. Nothing here is simulated.
 struct TurnStages: Equatable {
     var record: StageState = .pending
@@ -569,6 +567,7 @@ struct StagesRow: View {
         switch state {
         case .pending: status = "очікує"
         case .active: status = "триває"
+        case .waiting: status = "чекає дозволу"
         case .done: status = "готово"
         case .failed: status = "помилка"
         }

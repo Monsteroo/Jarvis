@@ -67,6 +67,36 @@ import Foundation
     log.record("bad", ["value": Double.nan])
     check(lines().isEmpty, "invalid JSON skipped")
 
+    // Key-like strings are masked in the written file; ordinary text and ids are not.
+    log.clear()
+    let marker = ConversationLog.redactionMarker
+    let openAI = "sk-proj-" + String(repeating: "aB3dE_f-", count: 5)
+    let eleven = "sk_" + String(repeating: "0a1b2c3d", count: 4)
+    let hex = "0123456789abcdef0123456789abcdef"
+    let generic = "Zx9Yw8Vu7Ts6Rq5Po4Nm3Lk2Ji1Hg0FeDcBa"
+    let bearerToken = "Bearer abc.DEF-123_456+789/xyz=="
+    let plain = "Котра година? 17:45, 21 листопада"
+    log.record("heard", ["raw": "мій ключ \(openAI) ось", "nested": ["a": ["x \(eleven)", hex], "b": "t=\(generic)."],
+                         "auth": "Authorization: \(bearerToken)", "plain": plain,
+                         "url": "https://example.com/uk/news?id=42", "words": "Authentication-Authorization-Configuration",
+                         "number": 1234567890123456789])
+    log.flush()
+    let raw = ConversationLog.files(in: root).compactMap { try? String(contentsOf: $0, encoding: .utf8) }.joined()
+    check(!raw.contains(openAI) && !raw.contains("sk-proj-"), "OpenAI key not in file")
+    check(raw.contains("мій ключ \(marker) ось"), "marker replaces OpenAI key inside sentence")
+    check(!raw.contains(eleven), "ElevenLabs key not in file")
+    check(!raw.contains(hex), "bare hex not in file")
+    check(!raw.contains(generic), "generic token not in file")
+    check(!raw.contains("abc.DEF-123"), "bearer token not in file")
+    check(raw.contains(plain), "Ukrainian sentence with numbers unchanged")
+    check(raw.contains("https://example.com/uk/news?id=42"), "URL without secret unchanged")
+    check(raw.contains("Authentication-Authorization-Configuration"), "long letters-only word unchanged")
+    check(raw.contains("1234567890123456789"), "numeric value unchanged")
+    let masked = lines().first
+    check((masked?["session"] as? String) == log.session, "session id unchanged")
+    check((masked?["time"] as? String)?.hasPrefix("2026-12-20") == true, "time field unchanged")
+    check(ConversationLog.maskSecrets("sk-short") == "sk-short", "short sk- text kept")
+
     print(failures == 0 ? "Conversation log tests passed (\(count))" : "Conversation log tests: \(failures) of \(count) failed")
     exit(failures == 0 ? 0 : 1)
  }
