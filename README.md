@@ -2,9 +2,9 @@
 
 <img src="docs/design/jarvis-icon.png" alt="Jarvis icon" width="72" />
 
-# Jarvis
+# Jarvis — Особистий голосовий помічник
 
-Нативний голосовий асистент для macOS Apple Silicon: українська та англійська, локальне розпізнавання й реальні дії на Mac.
+Нативний застосунок для macOS Apple Silicon: українська та англійська, локальне розпізнавання й реальні дії на Mac.
 
 ![macOS 14.5+](https://img.shields.io/badge/macOS-14.5%2B-0B1926?style=flat-square&logo=apple&logoColor=34E6F0)
 ![Apple Silicon](https://img.shields.io/badge/Apple%20Silicon-arm64-0B1926?style=flat-square&labelColor=050A10&color=1B3B4B)
