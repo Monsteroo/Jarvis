@@ -36,11 +36,13 @@ actor AgentActionBroker {
         plans.removeAll()
         current = ["uk", "en"].contains(language) ? (turn, language) : nil
     }
-    func propose(_ action: Action, turn: UUID, detail: String? = nil) throws -> AgentActionPlan {
+    func propose(_ action: Action, turn: UUID, detail: String? = nil, allowClipboardPaste: Bool = false) throws -> AgentActionPlan {
         guard current?.id == turn else { throw ApprovalError.inactiveTurn }
         switch action {
         case .dictate:
             throw ApprovalError.unsupportedAction // No model-triggered insertion into an implicit field.
+        case .clipboardPaste where !allowClipboardPaste:
+            throw ApprovalError.unsupportedAction // Goose/MCP cannot paste into an implicit field.
         case .uiSnapshot(let app?) where UIElementSecurity.isBlockedSensitiveApp(name: app):
             throw ApprovalError.unsupportedAction
         case .uiPress(let app, _, _) where UIElementSecurity.isBlockedSensitiveApp(name: app):

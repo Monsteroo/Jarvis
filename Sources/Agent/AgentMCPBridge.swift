@@ -49,12 +49,13 @@ actor AgentMCPBridge {
                     "tabCloseActive", "tabCloseLast", "uiSnapshot", "uiPress", "uiSetValue",
                     "tabNew", "noteNew", "mediaPlayPause", "tabSelect", "tabReopen", "tabPrevious", "tabNext",
                     "runShortcut",
+                    "clipboardRead", "clipboardWrite", "clipboardUndo",
                     "volumeSet", "volumeStep", "mute"
                 ].map(JSONValue.string))]),
                 "target": .object(["type": .string("string"), "maxLength": .number(2048)]),
                 "snapshot": .object(["type": .string("string"), "maxLength": .number(32)]),
                 "ref": .object(["type": .string("string"), "maxLength": .number(8)]),
-                "text": .object(["type": .string("string"), "maxLength": .number(4000)]),
+                "text": .object(["type": .string("string"), "maxLength": .number(16000)]),
                 "value": .object(["type": .string("integer"), "minimum": .number(-100), "maximum": .number(100)]),
                 "muted": .object(["type": .string("boolean")])])])
     }
@@ -98,6 +99,10 @@ actor AgentMCPBridge {
                   let ref = args["ref"].string,
                   let text = args["text"].string else { throw AgentError.invalidMessage }
             action = .uiSetValue(app: target, snapshotID: snapshot, ref: ref, text: text)
+        case "clipboardWrite", "clipboardPaste":
+            allowed = ["kind", "text"]
+            guard let text = args["text"].string else { throw AgentError.invalidMessage }
+            action = kind == "clipboardWrite" ? .clipboardWrite(text) : .clipboardPaste(text)
         case "tabSelect":
             // The model sometimes names the browser; the front browser is used either way.
             allowed = keys.contains("target") ? ["kind", "value", "target"] : ["kind", "value"]
@@ -123,6 +128,7 @@ actor AgentMCPBridge {
             case "windowLeftHalf": action = .windowLeftHalf; case "windowRightHalf": action = .windowRightHalf
             case "windowMinimizeAll": action = .windowMinimizeAll
             case "noteNew": action = .noteNew; case "mediaPlayPause": action = .mediaPlayPause
+            case "clipboardRead": action = .clipboardRead; case "clipboardUndo": action = .clipboardUndo
             default: throw AgentError.invalidMessage }
         }
         guard keys == allowed else { throw AgentError.invalidMessage }

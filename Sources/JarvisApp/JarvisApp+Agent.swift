@@ -102,8 +102,12 @@ extension JarvisApp {
                 var spoken = reply.isEmpty ? nil : AgentPersona.spokenPart(reply)
                 let turnPlans = plans.filter { $0.turn == voiceTurn }
                 let mustConfirm = confirmActions || turnPlans.contains {
-                    if case .runShortcut = $0.action { return true }
-                    return self.executor.effectivePolicy(for: $0.action) == .confirmation
+                    switch $0.action {
+                    case .runShortcut, .clipboardRead, .clipboardWrite, .clipboardUndo, .clipboardPaste:
+                        return true
+                    default:
+                        return self.executor.effectivePolicy(for: $0.action) == .confirmation
+                    }
                 }
                 self.updateActionStage(turn: id) {
                     $0.replyReady(aiNote: aiNote)
@@ -170,11 +174,11 @@ extension JarvisApp {
             updateActionStage(turn: id) { $0.resolve(plan.id, Self.actionStep(outcome)) }
             switch outcome {
             case .done(let summary):
-                // Window text is for the model only: never shown, spoken or logged.
-                summaries.append(Self.isSnapshot(plan.action) ? Self.snapshotReadPhrase(language: language) : summary)
+                // Window/clipboard text is for the model only: never shown, spoken or logged.
+                summaries.append(Self.isSnapshot(plan.action) ? Self.snapshotReadPhrase(for: plan.action, language: language) : summary)
             case .partial(let summary, let details):
-                // A snapshot whose history write failed arrives as partial with the window text as summary.
-                let shown = Self.isSnapshot(plan.action) ? Self.snapshotReadPhrase(language: language) : summary
+                // A snapshot whose history write failed arrives as partial with raw text as summary.
+                let shown = Self.isSnapshot(plan.action) ? Self.snapshotReadPhrase(for: plan.action, language: language) : summary
                 store.actionMessage = shown + " " + details; return shown
             case .failed(let reason): store.actionMessage = reason; return reason
             default: let text = language == "en" ? "The action did not run." : "Дію не виконано."; store.actionMessage = text; return text
@@ -190,11 +194,11 @@ extension JarvisApp {
         updateActionStage(turn: id) { $0.resolve(plan.id, Self.actionStep(outcome)) }
         switch outcome {
         case .done(let summary):
-            // Window text is for the model only: never shown, spoken or logged.
-            let text = Self.isSnapshot(plan.action) ? Self.snapshotReadPhrase(language: language) : summary
+            // Window/clipboard text is for the model only: never shown, spoken or logged.
+            let text = Self.isSnapshot(plan.action) ? Self.snapshotReadPhrase(for: plan.action, language: language) : summary
             store.actionMessage = text; speak(text, language: language)
         case .partial(let summary, let details):
-            let shown = Self.isSnapshot(plan.action) ? Self.snapshotReadPhrase(language: language) : summary
+            let shown = Self.isSnapshot(plan.action) ? Self.snapshotReadPhrase(for: plan.action, language: language) : summary
             store.actionMessage = shown + " " + details; speak(shown, language: language)
         case .failed(let reason):
             store.actionMessage = reason; speak(reason, language: language)

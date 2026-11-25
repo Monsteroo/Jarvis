@@ -53,9 +53,11 @@ import SwiftUI
                 guard self.valid, !Task.isCancelled else { return }
                 switch outcome {
                 case .done(let summary):
-                    // Never show a raw window snapshot (text meant only for the model).
+                    // Never show a raw window snapshot or raw clipboard payload (meant only for the model).
                     if case .uiSnapshot = plan.action {
                         self.results[plan.id] = actionText(self.language, "Вікно прочитано.", "Window read.")
+                    } else if case .clipboardRead = plan.action {
+                        self.results[plan.id] = actionText(self.language, "Буфер обміну прочитано.", "Clipboard read.")
                     } else {
                         self.results[plan.id] = summary
                     }
@@ -165,6 +167,18 @@ import SwiftUI
             return actionText(language, "Ввести у «", "Insert into ‘") + literal(app) + actionText(language, "» [", "’ [") + literal(ref) + "]: «" + literal(text) + "»"
         case .runShortcut(let name):
             return actionText(language, "Запустити команду Apple Shortcuts: ", "Run Apple Shortcut: ") + literal(name)
+        case .clipboardRead:
+            return actionText(language, "Прочитати текст із буфера обміну", "Read text from clipboard")
+        case .clipboardWrite(let text):
+            let masked = ClipboardSecretMasker.mask(text).masked
+            let preview = UISnapshotText.truncate(UISnapshotText.clean(masked), maxChars: 80)
+            return actionText(language, "Скопіювати в буфер (\(text.count) симв.): «", "Copy to clipboard (\(text.count) chars): ‘") + literal(preview) + actionText(language, "»", "’")
+        case .clipboardUndo:
+            return actionText(language, "Відновити попередній буфер обміну", "Restore previous clipboard")
+        case .clipboardPaste(let text):
+            let masked = ClipboardSecretMasker.mask(text).masked
+            let preview = UISnapshotText.truncate(UISnapshotText.clean(masked), maxChars: 80)
+            return actionText(language, "Вставити в активне поле (\(text.count) симв.): «", "Paste into active field (\(text.count) chars): ‘") + literal(preview) + actionText(language, "»", "’")
         case .volumeSet(let percent): return actionText(language, "Гучність: ", "Volume: ") + "\(percent)%"
         case .volumeStep(let step): return actionText(language, "Змінити гучність на ", "Change volume by ") + "\(step)%"
         case .mute(let muted): return muted ? actionText(language, "Вимкнути звук", "Mute") : actionText(language, "Увімкнути звук", "Unmute")

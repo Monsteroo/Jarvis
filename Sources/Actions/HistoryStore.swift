@@ -71,6 +71,8 @@ actor HistoryStore {
         case .tabPrevious: kind = "tabPrevious"; case .tabNext: kind = "tabNext"
         case .uiSnapshot: kind = "uiSnapshot"; case .uiPress: kind = "uiPress"; case .uiSetValue: kind = "uiSetValue"
         case .runShortcut: kind = "runShortcut"
+        case .clipboardRead: kind = "clipboardRead"; case .clipboardWrite: kind = "clipboardWrite"
+        case .clipboardUndo: kind = "clipboardUndo"; case .clipboardPaste: kind = "clipboardPaste"
         case .volumeSet: kind = "volumeSet"; case .volumeStep: kind = "volumeStep"; case .mute: kind = "mute"
         case .dictate: kind = "dictate"
         }

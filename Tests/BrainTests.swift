@@ -311,5 +311,29 @@ func usage(_ prompt: Int, cached: Int = 0, _ completion: Int) -> String {
         check(confirmRes?.rounds == 2 && confirmRes?.spoken == "Чекає вашого підтвердження на екрані, сер.", "Proposed UI write announces confirmation")
         let actionLogs = confirmRes?.actions.map(\.action).joined(separator: " ") ?? ""
         check(!actionLogs.contains("Secret note body") && actionLogs.contains("<redacted>"), "uiSetValue text redacted in action logs")
+
+        // 13. Clipboard read continues to next round for transformation, redacts clipboard payload from BrainMemory and action logs.
+        let fencedClip = UISnapshotText.fence(snapshotID: "clip1234", body: "# clipboard id=clip1234 chars=12 truncated=false masked=false\nПривіт, світ")
+        let clipTransport = FakeTransport([
+            (200, [tool(0, id: "c1", name: "run_action", args: "{\"kind\":\"clipboardRead\"}"), usage(80, 8), "data: [DONE]"]),
+            (200, [tool(0, id: "c2", name: "run_action", args: "{\"kind\":\"clipboardWrite\",\"text\":\"Hello, world\"}"), usage(120, 12), "data: [DONE]"]),
+        ])
+        let clipBrain = JarvisBrain(transport: clipTransport, model: "gpt-5.4-mini")
+        var clipActions: [Action] = []
+        let clipRes = try? await clipBrain.respond(
+            to: "Переклади буфер англійською", language: "uk", system: "S", context: "", apiKey: "k",
+            execute: { action in
+                clipActions.append(action)
+                if case .clipboardRead = action { return .executed(.done(summary: fencedClip)) }
+                return .executed(.done(summary: "Результат скопійовано в буфер обміну."))
+            },
+            onSentence: { _ in }
+        )
+        check(clipRes?.rounds == 2 && clipActions == [.clipboardRead, .clipboardWrite("Hello, world")], "clipboardRead continues to round 2 clipboardWrite")
+        let clipMem = clipBrain.memory.messages()
+        let leakedClip = clipMem.contains { ($0["content"] as? String)?.contains("Привіт, світ") == true }
+        check(!leakedClip, "Clipboard payload redacted from BrainMemory after turn")
+        let clipLogs = clipRes?.actions.map { $0.action + " " + $0.result }.joined(separator: " ") ?? ""
+        check(!clipLogs.contains("Привіт, світ") && !clipLogs.contains("Hello, world"), "Clipboard text redacted in Brain action logs")
     }
 }

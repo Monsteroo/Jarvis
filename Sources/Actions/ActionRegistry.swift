@@ -39,6 +39,8 @@ struct ActionRegistry {
             try text(content, max: 4000)
         case .runShortcut(let name):
             guard AppleShortcutAllowlistStore.isValidShortcutName(name) else { throw ActionError.invalidParameters }
+        case .clipboardWrite(let content), .clipboardPaste(let content):
+            try text(content, max: 16_000)
         case .tabSelect(let index): guard (1...9).contains(index) else { throw ActionError.invalidParameters }
         case .openURL(let raw): _ = try WebActions.validatedURL(raw)
         case .webSearch(let query): try text(query, max: 2048)
@@ -56,11 +58,12 @@ struct ActionRegistry {
         case .openApp, .activateApp, .quitApp, .openURL, .webSearch,
              .windowMinimize, .windowMaximize, .windowLeftHalf, .windowRightHalf, .windowMinimizeAll,
              .tabCloseActive, .tabCloseLast, .tabNew, .noteNew, .mediaPlayPause, .tabSelect, .tabReopen, .tabPrevious, .tabNext,
+             .clipboardWrite, .clipboardUndo,
              .volumeSet, .volumeStep, .mute, .dictate:
             return .immediate
         case .uiPress(let app, _, _):
             return UIElementSecurity.isSafeImmediatePressApp(name: app) ? .immediate : .confirmation
-        case .uiSetValue, .runShortcut:
+        case .uiSetValue, .runShortcut, .clipboardRead, .clipboardPaste:
             return .confirmation
         case .uiSnapshot(let app):
             // Window text goes to the cloud model: personal correspondence and data ask

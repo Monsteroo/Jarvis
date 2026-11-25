@@ -36,21 +36,27 @@ extension JarvisApp {
     }
 
     static func isSnapshot(_ action: Action) -> Bool {
-        if case .uiSnapshot = action { return true }
-        return false
+        switch action {
+        case .uiSnapshot, .clipboardRead: return true
+        default: return false
+        }
     }
 
-    /// Said and shown instead of the raw window text, which is for the model only.
-    static func snapshotReadPhrase(language: String) -> String {
-        language == "en" ? "Window read." : "Вікно прочитано."
+    /// Said and shown instead of raw window/clipboard text, which is for the model only.
+    static func snapshotReadPhrase(for action: Action, language: String) -> String {
+        if case .clipboardRead = action {
+            return language == "en" ? "Clipboard read." : "Буфер обміну прочитано."
+        }
+        return language == "en" ? "Window read." : "Вікно прочитано."
     }
 
-    /// Log label of a plan outcome; never contains window text.
+    /// Log label of a plan outcome; never contains window or clipboard text.
     static func planLogLabel(_ action: Action, _ outcome: CommandOutcome) -> String {
         guard isSnapshot(action) else { return "\(outcome)" }
+        let kind: String = { if case .clipboardRead = action { return "clipboard" }; return "snapshot" }()
         switch outcome {
-        case .done(let text): return "done (snapshot, \(text.count) chars)"
-        case .partial: return "partial (snapshot)"
+        case .done(let text): return "done (\(kind), \(text.count) chars)"
+        case .partial: return "partial (\(kind))"
         case .failed(let reason): return "failed: \(reason)"
         default: return "\(outcome)"
         }

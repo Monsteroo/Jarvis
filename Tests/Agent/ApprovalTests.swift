@@ -49,6 +49,13 @@ import Foundation
         let goodShortcutProposal = await bridge.handle(.object(["jsonrpc": .string("2.0"), "id": .number(8), "method": .string("tools/call"), "params": .object(["name": .string("propose_action"), "arguments": .object(["kind": .string("runShortcut"), "target": .string("Connect AirPods")])])]))
         check(goodShortcutProposal?["result"]["isError"] == .bool(false), "Valid runShortcut proposal accepted (awaits approval)")
         check(await executor.count == 1, "MCP runShortcut proposal still cannot execute")
+        // Clipboard actions: clipboardPaste blocked for Goose/MCP, clipboardRead/Write/Undo decode cleanly.
+        do { _ = try await broker.propose(.clipboardPaste("no implicit paste"), turn: turn2); fatalError("Goose clipboardPaste blocked") } catch ApprovalError.unsupportedAction { count += 1 }
+        let blockedPasteMCP = await bridge.handle(.object(["jsonrpc": .string("2.0"), "id": .number(9), "method": .string("tools/call"), "params": .object(["name": .string("propose_action"), "arguments": .object(["kind": .string("clipboardPaste"), "text": .string("hello")])])]))
+        check(blockedPasteMCP?["result"]["isError"] == .bool(true), "MCP clipboardPaste proposal blocked")
+        check(try AgentMCPBridge.decodeAction(.object(["kind": .string("clipboardRead")])) == .clipboardRead, "clipboardRead decoded")
+        check(try AgentMCPBridge.decodeAction(.object(["kind": .string("clipboardUndo")])) == .clipboardUndo, "clipboardUndo decoded")
+        check(try AgentMCPBridge.decodeAction(.object(["kind": .string("clipboardWrite"), "text": .string("Translated")])) == .clipboardWrite("Translated"), "clipboardWrite decoded")
         let clock = ApprovalClock()
         let expiring = AgentActionBroker(executor: executor, uptime: { clock.read() })
         let expiryTurn = UUID(); await expiring.begin(turn: expiryTurn, language: "en")

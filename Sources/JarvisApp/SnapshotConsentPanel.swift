@@ -6,17 +6,25 @@ import SwiftUI
 /// question per request; no answer within `timeout`, Esc or closing the
 /// panel all mean "no". The panel never becomes key, so focus stays put.
 @MainActor final class SnapshotConsentPanel: NSObject, ObservableObject, NSWindowDelegate {
+    struct ClipboardSummary {
+        let characterCount: Int
+        let preview: String
+        let secretsMasked: Bool
+    }
+
     let appName: String
     let request: String
     let language: String
+    let clipboard: ClipboardSummary?
     private var continuation: CheckedContinuation<Bool, Never>?
     private var panel: NSPanel?
     private var timer: Timer?
 
-    init(appName: String, request: String, language: String) {
+    init(appName: String, request: String, language: String, clipboard: ClipboardSummary? = nil) {
         self.appName = appName
         self.request = request
         self.language = language == "en" ? "en" : "uk"
+        self.clipboard = clipboard
     }
 
     /// Shows the question and waits for the owner. Always returns exactly once.
@@ -74,14 +82,29 @@ private final class ConsentWindow: NSPanel {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            Text(actionText(model.language, "ПРОЧИТАТИ ВІКНО?", "READ THE WINDOW?"))
-                .font(.system(size: 13, weight: .semibold, design: .monospaced)).tracking(2).foregroundStyle(cyan)
-            Text(actionText(model.language,
-                            "Jarvis хоче прочитати вікно «\(model.appName)» і передати його текст в OpenAI, щоб виконати запит:",
-                            "Jarvis wants to read the ‘\(model.appName)’ window and send its text to OpenAI for the request:"))
-                .font(.system(size: 15, weight: .medium)).fixedSize(horizontal: false, vertical: true)
-            Text("«\(model.request)»")
-                .font(.system(size: 14)).foregroundStyle(.secondary).lineLimit(3)
+            if let clip = model.clipboard {
+                Text(actionText(model.language, "ПРОЧИТАТИ БУФЕР ОБМІНУ?", "READ THE CLIPBOARD?"))
+                    .font(.system(size: 13, weight: .semibold, design: .monospaced)).tracking(2).foregroundStyle(cyan)
+                Text(actionText(model.language,
+                                "Jarvis хоче передати текст із буфера (\(clip.characterCount) симв.) в OpenAI для запиту:",
+                                "Jarvis wants to send clipboard text (\(clip.characterCount) chars) to OpenAI for the request:"))
+                    .font(.system(size: 15, weight: .medium)).fixedSize(horizontal: false, vertical: true)
+                Text("«\(clip.preview)»")
+                    .font(.system(size: 13, design: .monospaced)).foregroundStyle(.secondary).lineLimit(2)
+                if clip.secretsMasked {
+                    Text(actionText(model.language, "Увага: виявлені секрети/токени автоматично замасковано.", "Note: detected secrets/tokens were automatically masked."))
+                        .font(.system(size: 12)).foregroundStyle(Color.orange)
+                }
+            } else {
+                Text(actionText(model.language, "ПРОЧИТАТИ ВІКНО?", "READ THE WINDOW?"))
+                    .font(.system(size: 13, weight: .semibold, design: .monospaced)).tracking(2).foregroundStyle(cyan)
+                Text(actionText(model.language,
+                                "Jarvis хоче прочитати вікно «\(model.appName)» і передати його текст в OpenAI, щоб виконати запит:",
+                                "Jarvis wants to read the ‘\(model.appName)’ window and send its text to OpenAI for the request:"))
+                    .font(.system(size: 15, weight: .medium)).fixedSize(horizontal: false, vertical: true)
+                Text("«\(model.request)»")
+                    .font(.system(size: 14)).foregroundStyle(.secondary).lineLimit(3)
+            }
             Spacer(minLength: 0)
             HStack(spacing: 12) {
                 Button(actionText(model.language, "Дозволити один раз", "Allow once")) { model.answer(true) }

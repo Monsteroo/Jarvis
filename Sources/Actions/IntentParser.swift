@@ -44,7 +44,9 @@ struct IntentParser {
             "пауза": .mediaPlayPause, "постав на паузу": .mediaPlayPause, "постав відео на паузу": .mediaPlayPause,
             "зупини відео": .mediaPlayPause, "продовж відео": .mediaPlayPause, "продовжи відео": .mediaPlayPause,
             "зроби гучніше": .volumeStep(10), "зроби тихіше": .volumeStep(-10),
-            "вимкни звук": .mute(true), "увімкни звук": .mute(false)
+            "вимкни звук": .mute(true), "увімкни звук": .mute(false),
+            "поверни попередній буфер": .clipboardUndo, "поверни буфер": .clipboardUndo,
+            "віднови буфер": .clipboardUndo, "віднови попередній буфер": .clipboardUndo
         ] : [
             "minimize window": .windowMinimize, "maximize window": .windowMaximize,
             "minimize all windows": .windowMinimizeAll, "minimize everything": .windowMinimizeAll,
@@ -61,7 +63,9 @@ struct IntentParser {
             "pause": .mediaPlayPause, "pause the video": .mediaPlayPause, "pause video": .mediaPlayPause,
             "resume video": .mediaPlayPause, "resume the video": .mediaPlayPause,
             "volume up": .volumeStep(10), "volume down": .volumeStep(-10),
-            "mute": .mute(true), "unmute": .mute(false)
+            "mute": .mute(true), "unmute": .mute(false),
+            "restore previous clipboard": .clipboardUndo, "restore clipboard": .clipboardUndo,
+            "undo clipboard": .clipboardUndo
         ]
         if let match = phrases[command] { return match }
         let volumePrefix = language == "uk" ? "гучність " : "set volume to "

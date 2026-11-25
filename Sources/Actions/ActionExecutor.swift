@@ -19,6 +19,7 @@ final class ActionExecutor: CommandHandling {
     private let uiElements: UIElementActions?
     private let shortcuts: ShortcutActions?
     private let appleShortcuts: AppleShortcutActions?
+    private let clipboard: ClipboardActions?
     private let audioOutput: AudioOutputActions?
     private let dictation: DictationActions?
     private let history: HistoryStore?
@@ -26,12 +27,12 @@ final class ActionExecutor: CommandHandling {
     private let registry = ActionRegistry()
     let events = ActionEvents()
 
-    init(workspace: ActionWorkspace, windows: WindowActions? = nil, uiElements: UIElementActions? = nil, audioOutput: AudioOutputActions? = nil, dictation: DictationActions? = nil, history: HistoryStore? = nil, shortcuts: ShortcutActions? = nil, appleShortcuts: AppleShortcutActions? = nil) {
+    init(workspace: ActionWorkspace, windows: WindowActions? = nil, uiElements: UIElementActions? = nil, audioOutput: AudioOutputActions? = nil, dictation: DictationActions? = nil, history: HistoryStore? = nil, shortcuts: ShortcutActions? = nil, appleShortcuts: AppleShortcutActions? = nil, clipboard: ClipboardActions? = nil) {
         self.workspace = workspace; self.windows = windows; self.uiElements = uiElements; self.shortcuts = shortcuts
-        self.appleShortcuts = appleShortcuts; self.audioOutput = audioOutput; self.dictation = dictation; self.history = history
+        self.appleShortcuts = appleShortcuts; self.clipboard = clipboard; self.audioOutput = audioOutput; self.dictation = dictation; self.history = history
     }
     @MainActor static func live(aliases: AppAliases = .defaults, history: HistoryStore? = nil) -> ActionExecutor {
-        ActionExecutor(workspace: MacActionWorkspace(aliases: aliases), windows: WindowActions(access: MacWindowAccess()), uiElements: UIElementActions(access: MacUIElementAccess()), audioOutput: AudioOutputActions(access: MacOutputAccess()), dictation: DictationActions(access: MacDictationAccess()), history: history, shortcuts: ShortcutActions(access: MacShortcutAccess()), appleShortcuts: AppleShortcutActions.live())
+        ActionExecutor(workspace: MacActionWorkspace(aliases: aliases), windows: WindowActions(access: MacWindowAccess()), uiElements: UIElementActions(access: MacUIElementAccess()), audioOutput: AudioOutputActions(access: MacOutputAccess()), dictation: DictationActions(access: MacDictationAccess()), history: history, shortcuts: ShortcutActions(access: MacShortcutAccess()), appleShortcuts: AppleShortcutActions.live(), clipboard: ClipboardActions())
     }
 
     var appleShortcutBridge: AppleShortcutActions? { appleShortcuts }
@@ -42,7 +43,19 @@ final class ActionExecutor: CommandHandling {
         return try dictation.capture()
     }
     @MainActor func invalidateDictationTarget() { dictation?.invalidate() }
-    @MainActor func clearUISnapshots() { uiElements?.clearSnapshots() }
+    @MainActor func clearUISnapshots() {
+        uiElements?.clearSnapshots()
+        clipboard?.clearUndo()
+    }
+    @MainActor func inspectClipboardRead(requestText: String) -> ClipboardActions.InspectResult? {
+        clipboard?.inspectForRead(requestText: requestText)
+    }
+    @MainActor func clipboardReadWithContext(requestText: String, ownerConsented: Bool, language: String) -> CommandOutcome {
+        guard let clipboard else {
+            return .failed(reason: actionText(language, "Буфер обміну не підключено.", "Clipboard actions are not connected."))
+        }
+        return clipboard.read(language: language, requestText: requestText, ownerConsented: ownerConsented)
+    }
     /// Reads a window after the owner allowed it on screen (any app except the blocked ones).
     @MainActor func uiSnapshotWithOwnerConsent(_ action: Action, language: String) async -> CommandOutcome {
         guard case .uiSnapshot = action, (try? registry.validate(action)) != nil else {
@@ -93,9 +106,14 @@ final class ActionExecutor: CommandHandling {
             result = try await execute(action, language: language, dictationToken: dictationToken)
         } catch is CancellationError { result = cancelled(language) }
         catch { result = .failed(reason: actionText(language, "Не вдалося виконати дію. Перевірте програму й повторіть спробу.", "The action failed. Check the application and try again.")) }
-        // A window snapshot is read-only and its summary is the window text for the
-        // model only: a history failure must not turn it into a "partial" that is spoken.
-        let isSnapshot: Bool = { if case .uiSnapshot = action { return true }; return false }()
+        // A window snapshot or clipboard read is read-only and its summary is fenced text for
+        // the model only: a history failure must not turn it into a "partial" that is spoken.
+        let isSnapshot: Bool = {
+            switch action {
+            case .uiSnapshot, .clipboardRead: return true
+            default: return false
+            }
+        }()
         if let history, !isSnapshot {
             do { try await history.record(action: action, outcome: result, duration: ProcessInfo.processInfo.systemUptime - started) }
             catch {
@@ -152,6 +170,18 @@ final class ActionExecutor: CommandHandling {
         case .runShortcut:
             if let appleShortcuts { return await appleShortcuts.perform(action, language: language) }
             return .failed(reason: actionText(language, "Apple Shortcuts не підключено.", "Apple Shortcuts is not connected."))
+        case .clipboardRead:
+            if let clipboard { return await clipboard.read(language: language, ownerConsented: true) }
+            return .failed(reason: actionText(language, "Буфер обміну не підключено.", "Clipboard actions are not connected."))
+        case .clipboardWrite(let text):
+            if let clipboard { return await clipboard.write(text, language: language) }
+            return .failed(reason: actionText(language, "Буфер обміну не підключено.", "Clipboard actions are not connected."))
+        case .clipboardUndo:
+            if let clipboard { return await clipboard.undo(language: language) }
+            return .failed(reason: actionText(language, "Буфер обміну не підключено.", "Clipboard actions are not connected."))
+        case .clipboardPaste(let text):
+            if let clipboard { return await clipboard.paste(text, dictation: dictation, token: dictationToken, language: language) }
+            return .failed(reason: actionText(language, "Буфер обміну не підключено.", "Clipboard actions are not connected."))
         case .volumeSet, .volumeStep, .mute:
             if let audioOutput { return await audioOutput.perform(action, language: language) }
             return .failed(reason: actionText(language, "Керування звуком не підключено.", "Sound control is not connected."))

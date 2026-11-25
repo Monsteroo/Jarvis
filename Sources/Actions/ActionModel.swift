@@ -19,6 +19,7 @@ enum Action: Equatable, Codable, Sendable {
     case uiPress(app: String, snapshotID: String, ref: String)
     case uiSetValue(app: String, snapshotID: String, ref: String, text: String)
     case runShortcut(String)
+    case clipboardRead, clipboardWrite(String), clipboardUndo, clipboardPaste(String)
     case volumeSet(Int), volumeStep(Int), mute(Bool), dictate(String)
 }
 

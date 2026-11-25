@@ -104,16 +104,60 @@ extension JarvisApp {
                         self.logEvent("brain_action", ["action": "uiSnapshot", "outcome": loggedOutcome])
                         return .executed(outcome)
                     }
+                    if case .clipboardRead = action {
+                        let outcome: CommandOutcome
+                        switch self.executor.inspectClipboardRead(requestText: text) {
+                        case .blockedConcealed:
+                            outcome = .failed(reason: en
+                                ? "The clipboard contains concealed or transient data. Reading is blocked."
+                                : "Буфер містить захищені дані (менеджер паролів або тимчасовий запис). Читання заблоковано.")
+                        case .empty, .none:
+                            outcome = .failed(reason: en
+                                ? "The clipboard is empty or does not contain text."
+                                : "Буфер обміну порожній або не містить тексту.")
+                        case .ready(let info):
+                            if !confirm && info.allowsImmediate {
+                                self.store.actionMessage = en ? "Reading clipboard…" : "Читаю буфер…"
+                                outcome = .done(summary: info.fencedText)
+                            } else {
+                                let allowed = await self.askClipboardConsent(info: info, request: text, language: language)
+                                self.logEvent("clipboard_consent", ["chars": info.characterCount, "masked": info.secretsMasked, "allowed": allowed])
+                                guard allowed, !Task.isCancelled else {
+                                    self.logEvent("brain_action", ["action": "clipboardRead", "outcome": "not allowed"])
+                                    return .executed(.failed(reason: en
+                                        ? "The owner did not allow reading the clipboard. Do not try again in this request."
+                                        : "Власник не дозволив читати буфер обміну. Не пробуй знову в цьому запиті."))
+                                }
+                                self.store.actionMessage = en ? "Reading clipboard…" : "Читаю буфер…"
+                                // Return the exact inspected & owner-approved payload (no TOCTOU re-read).
+                                outcome = .done(summary: info.fencedText)
+                            }
+                        }
+                        let loggedOutcome: String
+                        switch outcome {
+                        case .done(let text): loggedOutcome = "done (\(text.count) chars)"
+                        case .failed(let reason): loggedOutcome = "failed: \(reason)"
+                        default: loggedOutcome = "\(outcome)"
+                        }
+                        self.logEvent("brain_action", ["action": "clipboardRead", "outcome": loggedOutcome])
+                        return .executed(outcome)
+                    }
                     let detail = self.executor.describeUIAction(action)
                     let policy = self.executor.effectivePolicy(for: action)
-                    let plan = try await parts.broker.propose(action, turn: voiceTurn, detail: detail)
+                    let allowPaste: Bool = { if case .clipboardPaste = action { return true }; return false }()
+                    let plan = try await parts.broker.propose(action, turn: voiceTurn, detail: detail, allowClipboardPaste: allowPaste)
                     if confirm || policy == .confirmation { return .proposed }
                     let token = try await parts.broker.approve(plan: plan.id)
                     let outcome = try await parts.broker.commit(plan: plan.id, token: token)
                     let actionName: String
-                    if case .uiSetValue(let app, let snap, let ref, _) = action {
+                    switch action {
+                    case .uiSetValue(let app, let snap, let ref, _):
                         actionName = "uiSetValue(\(app), \(snap), \(ref))"
-                    } else {
+                    case .clipboardWrite(let content):
+                        actionName = "clipboardWrite(\(content.count) chars)"
+                    case .clipboardPaste(let content):
+                        actionName = "clipboardPaste(\(content.count) chars)"
+                    default:
                         actionName = "\(action)"
                     }
                     self.logEvent("brain_action", ["action": actionName, "outcome": "\(outcome)"])
@@ -221,6 +265,23 @@ extension JarvisApp {
         snapshotConsent = panel
         store.actionMessage = language == "en" ? "Waiting for your permission to read the window." : "Чекаю вашого дозволу прочитати вікно."
         speakAfterCurrent(language == "en" ? "May I read this window, sir? Please answer on screen." : "Дозвольте прочитати вікно, сер. Відповідь на екрані.", language: language)
+        let allowed = await panel.ask()
+        if snapshotConsent === panel { snapshotConsent = nil }
+        return allowed
+    }
+
+    /// Shows the clipboard consent panel with a post-masking 80-char preview.
+    @MainActor func askClipboardConsent(info: ClipboardReadInspection, request: String, language: String) async -> Bool {
+        snapshotConsent?.cancel()
+        let summary = SnapshotConsentPanel.ClipboardSummary(
+            characterCount: info.characterCount,
+            preview: info.preview,
+            secretsMasked: info.secretsMasked
+        )
+        let panel = SnapshotConsentPanel(appName: "", request: request, language: language, clipboard: summary)
+        snapshotConsent = panel
+        store.actionMessage = language == "en" ? "Waiting for your permission to read the clipboard." : "Чекаю вашого дозволу прочитати буфер обміну."
+        speakAfterCurrent(language == "en" ? "May I read the clipboard, sir? Please answer on screen." : "Дозвольте прочитати буфер обміну, сер. Відповідь на екрані.", language: language)
         let allowed = await panel.ask()
         if snapshotConsent === panel { snapshotConsent = nil }
         return allowed

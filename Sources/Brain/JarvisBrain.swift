@@ -173,6 +173,10 @@ final class JarvisBrain {
                                     sawSnapshot = true
                                     toolText = summary
                                     result.actions.append((action: actionLabel, result: "Done: snapshot (\(summary.count) chars)"))
+                                } else if case .clipboardRead = action {
+                                    sawSnapshot = true
+                                    toolText = summary
+                                    result.actions.append((action: actionLabel, result: "Done: clipboard (\(summary.count) chars)"))
                                 } else {
                                     summaries.append(summary)
                                     toolText = "Done: \(summary)"
@@ -315,10 +319,16 @@ final class JarvisBrain {
     }
 
     private static func safeActionLogLabel(_ action: Action) -> String {
-        if case .uiSetValue(let app, let snapshotID, let ref, _) = action {
+        switch action {
+        case .uiSetValue(let app, let snapshotID, let ref, _):
             return "uiSetValue(app: \"\(app)\", snapshotID: \"\(snapshotID)\", ref: \"\(ref)\", text: <redacted>)"
+        case .clipboardWrite(let text):
+            return "clipboardWrite(text: <redacted, \(text.count) chars>)"
+        case .clipboardPaste(let text):
+            return "clipboardPaste(text: <redacted, \(text.count) chars>)"
+        default:
+            return "\(action)"
         }
-        return "\(action)"
     }
 
     private static func redactSnapshotsForMemory(_ turn: [[String: Any]]) -> [[String: Any]] {
@@ -354,6 +364,10 @@ final class JarvisBrain {
             uiPress {target: application name, snapshot: snapshot id, ref: eN} presses an element from a fresh uiSnapshot; \
             uiSetValue {target: application name, snapshot: snapshot id, ref: eN, text: value} writes text into a field without sending; \
             runShortcut {target: exact name from the owner's allowed Apple Shortcuts list} runs an allowlisted macOS Shortcut; \
+            clipboardRead {} reads masked clipboard text (up to 8000 chars); \
+            clipboardWrite {text: value} copies text to the clipboard; \
+            clipboardUndo {} restores the previous clipboard entry; \
+            clipboardPaste {text: value} copies and inserts text into the active field (awaits confirmation); \
             volumeSet {value: 0…100}; volumeStep {value: -100…100}; mute {muted: true|false}. Call it once per action, in order.
             """,
             "parameters": [
@@ -365,12 +379,13 @@ final class JarvisBrain {
                         "tabCloseActive", "tabCloseLast", "uiSnapshot", "uiPress", "uiSetValue",
                         "tabNew", "noteNew", "mediaPlayPause", "tabSelect", "tabReopen", "tabPrevious", "tabNext",
                         "runShortcut",
+                        "clipboardRead", "clipboardWrite", "clipboardUndo", "clipboardPaste",
                         "volumeSet", "volumeStep", "mute"
                     ]],
                     "target": ["type": "string", "maxLength": 2048],
                     "snapshot": ["type": "string", "maxLength": 32],
                     "ref": ["type": "string", "maxLength": 8],
-                    "text": ["type": "string", "maxLength": 4000],
+                    "text": ["type": "string", "maxLength": 16000],
                     "value": ["type": "integer", "minimum": -100, "maximum": 100],
                     "muted": ["type": "boolean"],
                 ],
