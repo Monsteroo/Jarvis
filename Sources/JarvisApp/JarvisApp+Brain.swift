@@ -40,7 +40,7 @@ extension JarvisApp {
         let confirm = store.confirmAgentActions
         let mac = MacContext.current()
         let system = AgentPersona.brainSystem(language: language, installedApps: mac.installed)
-        let context = AgentPersona.brainContext(language: language, apps: mac.line(language: language))
+        let context = AgentPersona.brainContext(language: language, apps: mac.line(language: language), shortcuts: executor.allowlistedShortcutNames())
         let voiceTurn = UUID()
         let started = ProcessInfo.processInfo.systemUptime
         brainSpokeTurn = nil

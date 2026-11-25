@@ -18,6 +18,7 @@ final class ActionExecutor: CommandHandling {
     private let windows: WindowActions?
     private let uiElements: UIElementActions?
     private let shortcuts: ShortcutActions?
+    private let appleShortcuts: AppleShortcutActions?
     private let audioOutput: AudioOutputActions?
     private let dictation: DictationActions?
     private let history: HistoryStore?
@@ -25,13 +26,16 @@ final class ActionExecutor: CommandHandling {
     private let registry = ActionRegistry()
     let events = ActionEvents()
 
-    init(workspace: ActionWorkspace, windows: WindowActions? = nil, uiElements: UIElementActions? = nil, audioOutput: AudioOutputActions? = nil, dictation: DictationActions? = nil, history: HistoryStore? = nil, shortcuts: ShortcutActions? = nil) {
+    init(workspace: ActionWorkspace, windows: WindowActions? = nil, uiElements: UIElementActions? = nil, audioOutput: AudioOutputActions? = nil, dictation: DictationActions? = nil, history: HistoryStore? = nil, shortcuts: ShortcutActions? = nil, appleShortcuts: AppleShortcutActions? = nil) {
         self.workspace = workspace; self.windows = windows; self.uiElements = uiElements; self.shortcuts = shortcuts
-        self.audioOutput = audioOutput; self.dictation = dictation; self.history = history
+        self.appleShortcuts = appleShortcuts; self.audioOutput = audioOutput; self.dictation = dictation; self.history = history
     }
     @MainActor static func live(aliases: AppAliases = .defaults, history: HistoryStore? = nil) -> ActionExecutor {
-        ActionExecutor(workspace: MacActionWorkspace(aliases: aliases), windows: WindowActions(access: MacWindowAccess()), uiElements: UIElementActions(access: MacUIElementAccess()), audioOutput: AudioOutputActions(access: MacOutputAccess()), dictation: DictationActions(access: MacDictationAccess()), history: history, shortcuts: ShortcutActions(access: MacShortcutAccess()))
+        ActionExecutor(workspace: MacActionWorkspace(aliases: aliases), windows: WindowActions(access: MacWindowAccess()), uiElements: UIElementActions(access: MacUIElementAccess()), audioOutput: AudioOutputActions(access: MacOutputAccess()), dictation: DictationActions(access: MacDictationAccess()), history: history, shortcuts: ShortcutActions(access: MacShortcutAccess()), appleShortcuts: AppleShortcutActions.live())
     }
+
+    var appleShortcutBridge: AppleShortcutActions? { appleShortcuts }
+    func allowlistedShortcutNames() -> [String] { appleShortcuts?.allowlistedNames() ?? [] }
 
     @MainActor func captureDictationTarget() throws -> UUID {
         guard let dictation else { throw DeviceActionError.unavailable }
@@ -51,7 +55,8 @@ final class ActionExecutor: CommandHandling {
     }
     @MainActor func describeUIAction(_ action: Action) -> String? { uiElements?.describeTarget(for: action) }
     @MainActor func effectivePolicy(for action: Action) -> ApprovalPolicy {
-        uiElements?.effectivePolicy(for: action) ?? registry.policy(for: action)
+        if let shortcutPolicy = appleShortcuts?.effectivePolicy(for: action) { return shortcutPolicy }
+        return uiElements?.effectivePolicy(for: action) ?? registry.policy(for: action)
     }
 
     func handle(_ text: String, language: String) async -> CommandOutcome {
@@ -62,7 +67,15 @@ final class ActionExecutor: CommandHandling {
             return .failed(reason: "Оберіть українську або англійську мову.")
         }
         guard !Task.isCancelled else { return cancelled(language) }
-        guard let action = parser.parse(text, language: language) else { return .notUnderstood }
+        let parsed = parser.parse(text, language: language)
+            ?? appleShortcuts?.matchDirectPhrase(text, language: language).map { Action.runShortcut($0.name) }
+        guard let action = parsed else { return .notUnderstood }
+        if case .runShortcut(let rawName) = action,
+           let entry = appleShortcuts?.resolve(rawName, language: language),
+           entry.requiresConfirmation {
+            let summary = actionText(language, "Запустити команду Apple Shortcuts «\(entry.name)»?", "Run Apple Shortcut ‘\(entry.name)’?")
+            return .needsApproval(ApprovalRequest(id: UUID(), turnID: UUID(), action: .runShortcut(entry.name), summary: summary, expiresAt: Date().addingTimeInterval(120)))
+        }
         return await handle(action: action, language: language, dictationToken: dictationToken)
     }
     /// Typed callers still pass through the same language/schema/cancellation gates.
@@ -136,6 +149,9 @@ final class ActionExecutor: CommandHandling {
         case .tabCloseActive, .tabCloseLast, .uiSnapshot, .uiPress, .uiSetValue:
             if let uiElements { return await uiElements.perform(action, language: language) }
             return .failed(reason: actionText(language, "Керування елементами вікна не підключено.", "Window element control is not connected."))
+        case .runShortcut:
+            if let appleShortcuts { return await appleShortcuts.perform(action, language: language) }
+            return .failed(reason: actionText(language, "Apple Shortcuts не підключено.", "Apple Shortcuts is not connected."))
         case .volumeSet, .volumeStep, .mute:
             if let audioOutput { return await audioOutput.perform(action, language: language) }
             return .failed(reason: actionText(language, "Керування звуком не підключено.", "Sound control is not connected."))

@@ -163,6 +163,8 @@ import SwiftUI
             return actionText(language, "Натиснути елемент у «", "Press element in ‘") + literal(app) + actionText(language, "» [", "’ [") + literal(ref) + "]"
         case .uiSetValue(let app, _, let ref, let text):
             return actionText(language, "Ввести у «", "Insert into ‘") + literal(app) + actionText(language, "» [", "’ [") + literal(ref) + "]: «" + literal(text) + "»"
+        case .runShortcut(let name):
+            return actionText(language, "Запустити команду Apple Shortcuts: ", "Run Apple Shortcut: ") + literal(name)
         case .volumeSet(let percent): return actionText(language, "Гучність: ", "Volume: ") + "\(percent)%"
         case .volumeStep(let step): return actionText(language, "Змінити гучність на ", "Change volume by ") + "\(step)%"
         case .mute(let muted): return muted ? actionText(language, "Вимкнути звук", "Mute") : actionText(language, "Увімкнути звук", "Unmute")

@@ -98,6 +98,10 @@ final class VoiceStore: ObservableObject {
     @Published var hasCloudKey = false
     @Published var cloudStatus = ""
     @Published var cloudUsed = 0
+    @Published var allowlistedShortcuts: [AllowlistedShortcut] = []
+    @Published var availableMacShortcuts: [String] = []
+    @Published var shortcutsLoading = false
+    @Published var shortcutsStatus = ""
 
     func refreshCloudUsage() { cloudUsed = VoiceUsageLedger.load().used(at: Date()) }
 
@@ -217,6 +221,10 @@ struct VoiceActions {
     var openMicrophoneSettings: () -> Void = {}
     var revealConversations: () -> Void = {}
     var clearConversations: () -> Void = {}
+    var refreshMacShortcuts: () -> Void = {}
+    var addAllowlistedShortcut: (String, String, String, Bool) -> Void = { _, _, _, _ in }
+    var updateAllowlistedShortcut: (AllowlistedShortcut) -> Void = { _ in }
+    var removeAllowlistedShortcut: (String) -> Void = { _ in }
 }
 
 // MARK: - Shared pieces
@@ -629,6 +637,9 @@ struct DiagnosticsView: View {
                     Toggle("Підтверджувати дії AI у вікні плану", isOn: $store.confirmAgentActions)
                     note("Вимкнено: дії, які пропонує AI (відкрити програму чи сайт, вікна, гучність), виконуються одразу. Диктування від AI заборонене завжди. Esc скасовує.")
                 }
+                section("Apple Shortcuts (білий список)") {
+                    AppleShortcutsSettings(store: store, actions: actions)
+                }
                 section("Журнал розмов") {
                     Toggle("Записувати розмови локально (текст і час етапів, без аудіо)", isOn: $store.conversationLog)
                     HStack {
@@ -829,6 +840,89 @@ struct AgentSettings: View {
                 Text(store.agentStatus).font(.system(size: 12)).foregroundStyle(ArcPalette.secondary)
             }
             Text("В OpenAI іде лише текст такої команди, аудіо — ні. Агент може лише запропонувати дію: вона виконається тільки після «Підтвердити один раз» у панелі плану. Ліміт — $10 на місяць.")
+                .font(.system(size: 12)).foregroundStyle(ArcPalette.secondary).fixedSize(horizontal: false, vertical: true)
+        }
+    }
+}
+
+/// Owner-managed allowlist for local Apple Shortcuts (/usr/bin/shortcuts run).
+struct AppleShortcutsSettings: View {
+    @ObservedObject var store: VoiceStore
+    let actions: VoiceActions
+    @State private var selectedName = ""
+    @State private var aliasUK = ""
+    @State private var aliasEN = ""
+    @State private var requiresConfirmation = false
+
+    private var candidateNames: [String] {
+        let existing = Set(store.allowlistedShortcuts.map { $0.name.lowercased() })
+        return store.availableMacShortcuts.filter { !existing.contains($0.lowercased()) }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Button(store.shortcutsLoading ? "Завантажую…" : "Завантажити список із Mac", action: actions.refreshMacShortcuts)
+                    .disabled(store.shortcutsLoading)
+                if !candidateNames.isEmpty {
+                    Picker("Команда з Mac", selection: $selectedName) {
+                        Text("Оберіть команду…").tag("")
+                        ForEach(candidateNames, id: \.self) { Text($0).tag($0) }
+                    }
+                    .frame(width: 260)
+                }
+            }
+            HStack(spacing: 8) {
+                TextField("Точна назва Shortcut", text: $selectedName).frame(width: 200)
+                TextField("Псевдонім (uk, через кому)", text: $aliasUK).frame(width: 190)
+                TextField("Alias (en, comma-separated)", text: $aliasEN).frame(width: 190)
+            }
+            HStack {
+                Toggle("Підтверджувати перед запуском", isOn: $requiresConfirmation)
+                Spacer()
+                Button("Додати до білого списку") {
+                    actions.addAllowlistedShortcut(selectedName, aliasUK, aliasEN, requiresConfirmation)
+                    selectedName = ""
+                    aliasUK = ""
+                    aliasEN = ""
+                    requiresConfirmation = false
+                }
+                .disabled(selectedName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+            if store.allowlistedShortcuts.isEmpty {
+                Text("Білий список порожній. Додайте дозволені команди вище.")
+                    .font(.system(size: 12)).foregroundStyle(ArcPalette.secondary)
+            } else {
+                VStack(alignment: .leading, spacing: 6) {
+                    ForEach(store.allowlistedShortcuts) { entry in
+                        HStack(spacing: 10) {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(entry.name).font(.system(size: 13, weight: .medium)).foregroundStyle(ArcPalette.text)
+                                let aliases = (entry.aliasesUK + entry.aliasesEN).joined(separator: ", ")
+                                if !aliases.isEmpty {
+                                    Text(aliases).font(.system(size: 11)).foregroundStyle(ArcPalette.secondary)
+                                }
+                            }
+                            Spacer()
+                            Toggle("Підтверджувати", isOn: Binding(
+                                get: { entry.requiresConfirmation },
+                                set: { next in
+                                    var copy = entry
+                                    copy.requiresConfirmation = next
+                                    actions.updateAllowlistedShortcut(copy)
+                                }
+                            ))
+                            .toggleStyle(.checkbox)
+                            Button("Видалити") { actions.removeAllowlistedShortcut(entry.name) }
+                        }
+                        .padding(.vertical, 4)
+                    }
+                }
+            }
+            if !store.shortcutsStatus.isEmpty {
+                Text(store.shortcutsStatus).font(.system(size: 12)).foregroundStyle(ArcPalette.secondary)
+            }
+            Text("Виконуються лише команди з цього списку напряму через /usr/bin/shortcuts без shell (таймаут 15 с, Esc скасовує). За замовчуванням список порожній.")
                 .font(.system(size: 12)).foregroundStyle(ArcPalette.secondary).fixedSize(horizontal: false, vertical: true)
         }
     }

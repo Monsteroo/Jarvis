@@ -70,6 +70,7 @@ actor HistoryStore {
         case .tabSelect: kind = "tabSelect"; case .tabReopen: kind = "tabReopen"
         case .tabPrevious: kind = "tabPrevious"; case .tabNext: kind = "tabNext"
         case .uiSnapshot: kind = "uiSnapshot"; case .uiPress: kind = "uiPress"; case .uiSetValue: kind = "uiSetValue"
+        case .runShortcut: kind = "runShortcut"
         case .volumeSet: kind = "volumeSet"; case .volumeStep: kind = "volumeStep"; case .mute: kind = "mute"
         case .dictate: kind = "dictate"
         }

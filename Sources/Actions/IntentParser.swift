@@ -18,6 +18,14 @@ struct IntentParser {
             let value = String(raw.dropFirst(prefix.count)).trimmingCharacters(in: .whitespaces)
             return value.isEmpty ? nil : build(value)
         }
+        let shortcutPrefixes = language == "uk"
+            ? ["запусти команду ", "запусти шорткат ", "виконай команду "]
+            : ["run shortcut "]
+        for prefix in shortcutPrefixes where lower.hasPrefix(prefix) {
+            let value = String(raw.dropFirst(prefix.count))
+                .trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: ".!?«»\"'")))
+            return value.isEmpty ? nil : .runShortcut(value)
+        }
         let command = lower.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: ".!?")))
         let phrases: [String: Action] = language == "uk" ? [
             "згорни вікно": .windowMinimize, "розгорни вікно": .windowMaximize,

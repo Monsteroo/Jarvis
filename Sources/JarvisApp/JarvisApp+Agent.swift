@@ -101,7 +101,10 @@ extension JarvisApp {
                 guard !Task.isCancelled, self.store.machine.turn == id, self.store.requestActivity.turn == id else { return }
                 var spoken = reply.isEmpty ? nil : AgentPersona.spokenPart(reply)
                 let turnPlans = plans.filter { $0.turn == voiceTurn }
-                let mustConfirm = confirmActions || turnPlans.contains { self.executor.effectivePolicy(for: $0.action) == .confirmation }
+                let mustConfirm = confirmActions || turnPlans.contains {
+                    if case .runShortcut = $0.action { return true }
+                    return self.executor.effectivePolicy(for: $0.action) == .confirmation
+                }
                 self.updateActionStage(turn: id) {
                     $0.replyReady(aiNote: aiNote)
                     if !turnPlans.isEmpty { $0.expect(turnPlans.map(\.id), approval: mustConfirm) }

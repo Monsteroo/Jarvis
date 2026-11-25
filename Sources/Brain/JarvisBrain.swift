@@ -353,6 +353,7 @@ final class JarvisBrain {
             uiSnapshot {optional target: application name} reads accessible window elements with a snapshot id and e1…eN refs; \
             uiPress {target: application name, snapshot: snapshot id, ref: eN} presses an element from a fresh uiSnapshot; \
             uiSetValue {target: application name, snapshot: snapshot id, ref: eN, text: value} writes text into a field without sending; \
+            runShortcut {target: exact name from the owner's allowed Apple Shortcuts list} runs an allowlisted macOS Shortcut; \
             volumeSet {value: 0…100}; volumeStep {value: -100…100}; mute {muted: true|false}. Call it once per action, in order.
             """,
             "parameters": [
@@ -363,6 +364,7 @@ final class JarvisBrain {
                         "windowMinimize", "windowMaximize", "windowLeftHalf", "windowRightHalf", "windowMinimizeAll",
                         "tabCloseActive", "tabCloseLast", "uiSnapshot", "uiPress", "uiSetValue",
                         "tabNew", "noteNew", "mediaPlayPause", "tabSelect", "tabReopen", "tabPrevious", "tabNext",
+                        "runShortcut",
                         "volumeSet", "volumeStep", "mute"
                     ]],
                     "target": ["type": "string", "maxLength": 2048],

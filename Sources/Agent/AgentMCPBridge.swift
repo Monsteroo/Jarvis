@@ -48,6 +48,7 @@ actor AgentMCPBridge {
                     "windowMinimize", "windowMaximize", "windowLeftHalf", "windowRightHalf", "windowMinimizeAll",
                     "tabCloseActive", "tabCloseLast", "uiSnapshot", "uiPress", "uiSetValue",
                     "tabNew", "noteNew", "mediaPlayPause", "tabSelect", "tabReopen", "tabPrevious", "tabNext",
+                    "runShortcut",
                     "volumeSet", "volumeStep", "mute"
                 ].map(JSONValue.string))]),
                 "target": .object(["type": .string("string"), "maxLength": .number(2048)]),
@@ -62,11 +63,12 @@ actor AgentMCPBridge {
         let keys = Set(fields.keys)
         let action: Action, allowed: Set<String>
         switch kind {
-        case "openApp", "activateApp", "quitApp", "openURL", "webSearch":
+        case "openApp", "activateApp", "quitApp", "openURL", "webSearch", "runShortcut":
             allowed = ["kind", "target"]
             guard let target = args["target"].string else { throw AgentError.invalidMessage }
             switch kind { case "openApp": action = .openApp(target); case "activateApp": action = .activateApp(target)
-            case "quitApp": action = .quitApp(target); case "openURL": action = .openURL(target); default: action = .webSearch(target) }
+            case "quitApp": action = .quitApp(target); case "openURL": action = .openURL(target)
+            case "runShortcut": action = .runShortcut(target); default: action = .webSearch(target) }
         case "tabCloseActive", "tabCloseLast", "uiSnapshot", "tabNew":
             let appTarget: String?
             if keys == ["kind"] {

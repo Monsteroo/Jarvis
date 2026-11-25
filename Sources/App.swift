@@ -84,7 +84,13 @@ final class JarvisApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone")!)
             },
             revealConversations: { [weak self] in self?.revealConversations() },
-            clearConversations: { [weak self] in self?.clearConversations() })
+            clearConversations: { [weak self] in self?.clearConversations() },
+            refreshMacShortcuts: { [weak self] in self?.refreshMacShortcuts() },
+            addAllowlistedShortcut: { [weak self] name, uk, en, confirm in
+                self?.addAllowlistedShortcut(name: name, aliasUK: uk, aliasEN: en, requiresConfirmation: confirm)
+            },
+            updateAllowlistedShortcut: { [weak self] entry in self?.updateAllowlistedShortcut(entry) },
+            removeAllowlistedShortcut: { [weak self] name in self?.removeAllowlistedShortcut(named: name) })
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -101,6 +107,7 @@ final class JarvisApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         store.agentRuntimeReady = FileManager.default.isExecutableFile(atPath: gooseExecutable.path)
             && FileManager.default.isExecutableFile(atPath: helperExecutable.path)
         loadKeys()
+        loadAllowlistedShortcuts()
         conversationLog.prune()
         store.loadVoices()
         audio.onLimit = { [weak self] in self?.finishRecording(timedOut: true) }

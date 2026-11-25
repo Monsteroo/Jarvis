@@ -82,11 +82,34 @@ extension JarvisApp {
             setActionStage(.failed, note: en ? "failed" : "не виконано")
             store.actionMessage = reason
             spoken = reason
-        case .needsApproval:
-            // No action in the current registry asks for approval; never auto-approve.
-            setActionStage(.failed, note: en ? "needs approval" : "потрібне підтвердження")
-            store.actionMessage = en ? "This action needs confirmation, which is not connected yet." : "Ця дія потребує підтвердження, яке ще не підключено."
-            spoken = store.actionMessage
+        case .needsApproval(let request):
+            let broker = AgentActionBroker(executor: LocalTypedActionRunner(executor))
+            let voiceTurn = request.turnID
+            beginRequest(turn: id, phase: .approval)
+            store.actionMessage = request.summary
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                let controller = AgentApprovalController(broker: broker, turn: voiceTurn, language: language,
+                    onEnd: { [weak self] in
+                        guard let self else { return }
+                        self.updateActionStage(turn: id) { $0.settle() }
+                        self.finishRequest(turn: id)
+                    }) { [weak self] plan, outcome in
+                    self?.agentPlanFinished(plan, outcome, turn: id, language: language)
+                }
+                self.approval = controller
+                await broker.begin(turn: voiceTurn, language: language)
+                guard let plan = try? await broker.propose(request.action, turn: voiceTurn) else {
+                    self.setActionStage(.failed, note: en ? "rejected" : "відхилено")
+                    self.finishRequest(turn: id)
+                    return
+                }
+                guard self.store.machine.turn == id else { return }
+                self.updateActionStage(turn: id) { $0.expect([plan.id], approval: true) }
+                await controller.show()
+            }
+            speak(en ? "It awaits your confirmation on screen, sir." : "Чекає вашого підтвердження на екрані, сер.", language: language)
+            return
         case .notUnderstood where brainAvailable:
             logEvent("action", ["result": "notUnderstood", "next": "brain", "seconds": Self.rounded(seconds)])
             runBrain(lastCommandText, turn: lastCommandTurn, language: language)

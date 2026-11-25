@@ -91,6 +91,8 @@ func usage(_ prompt: Int, cached: Int = 0, _ completion: Int) -> String {
 
         // Argument decoding uses the strict action schema.
         check(JarvisBrain.decode("{\"kind\":\"quitApp\",\"target\":\"Calendar\"}") == .quitApp("Calendar"), "decode quitApp")
+        check(JarvisBrain.decode("{\"kind\":\"runShortcut\",\"target\":\"Connect AirPods\"}") == .runShortcut("Connect AirPods"), "decode runShortcut")
+        check(JarvisBrain.decode("{\"kind\":\"runShortcut\",\"target\":\"bad; rm -rf\"}") == nil, "invalid runShortcut rejected")
         check(JarvisBrain.decode("{\"kind\":\"dictate\",\"target\":\"x\"}") == nil, "dictation is not a brain action")
         check(JarvisBrain.decode("{\"kind\":\"openApp\",\"target\":\"X\",\"extra\":1}") == nil, "extra fields rejected")
         check(JarvisBrain.decode("not json") == nil, "garbage rejected")

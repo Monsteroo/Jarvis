@@ -37,6 +37,8 @@ struct ActionRegistry {
             try snapshotID(snap)
             try elementRef(ref)
             try text(content, max: 4000)
+        case .runShortcut(let name):
+            guard AppleShortcutAllowlistStore.isValidShortcutName(name) else { throw ActionError.invalidParameters }
         case .tabSelect(let index): guard (1...9).contains(index) else { throw ActionError.invalidParameters }
         case .openURL(let raw): _ = try WebActions.validatedURL(raw)
         case .webSearch(let query): try text(query, max: 2048)
@@ -58,7 +60,7 @@ struct ActionRegistry {
             return .immediate
         case .uiPress(let app, _, _):
             return UIElementSecurity.isSafeImmediatePressApp(name: app) ? .immediate : .confirmation
-        case .uiSetValue:
+        case .uiSetValue, .runShortcut:
             return .confirmation
         case .uiSnapshot(let app):
             // Window text goes to the cloud model: personal correspondence and data ask

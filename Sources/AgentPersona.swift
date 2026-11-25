@@ -138,8 +138,8 @@ enum AgentPersona {
         """
     }
 
-    /// Dynamic part of each brain request: the clock and open applications.
-    static func brainContext(language: String, apps: String, now: Date = Date(), timeZone: TimeZone = .current) -> String {
+    /// Dynamic part of each brain request: the clock, open applications, and allowlisted Apple Shortcuts.
+    static func brainContext(language: String, apps: String, shortcuts: [String] = [], now: Date = Date(), timeZone: TimeZone = .current) -> String {
         let clock = DateFormatter()
         clock.locale = Locale(identifier: "en_US_POSIX")
         clock.timeZone = timeZone
@@ -149,7 +149,14 @@ enum AgentPersona {
         let time = language == "en"
             ? "Now on his Mac: \(clock.string(from: now)), \(timeZone.identifier) (\(offset))."
             : "Зараз на його Mac: \(clock.string(from: now)), \(timeZone.identifier) (\(offset))."
-        return "[\(time) \(apps)]"
+        if shortcuts.isEmpty {
+            return "[\(time) \(apps)]"
+        }
+        let list = shortcuts.prefix(40).joined(separator: ", ")
+        let shortcutsLine = language == "en"
+            ? "Allowed Apple Shortcuts: \(list)."
+            : "Дозволені команди Apple Shortcuts: \(list)."
+        return "[\(time) \(apps) \(shortcutsLine)]"
     }
 
     /// Spoken at once while the agent thinks (its first answer can take a
