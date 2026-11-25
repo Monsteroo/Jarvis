@@ -60,9 +60,9 @@ flowchart LR
 ## Інтерфейс ARC Current
 
 <div align="center">
-<img src="docs/design/jarvis-arc-current.png" alt="ARC Current visual direction" width="760" />
+<img src="docs/design/jarvis-app-live.jpg" alt="Реальний інтерфейс Jarvis на macOS" width="760" />
 <br />
-<sub><em>Затверджений візуальний напрям ARC Current: темне скло, горизонтальні світлові голосові нитки й нейронні імпульси (без сферичного ядра).</em></sub>
+<sub><em>Реальний інтерфейс Jarvis на macOS (ARC Current: локальна модель Parakeet UK, горизонтальні світлові нитки, жива шкала етапів і миттєвий контроль мікрофона).</em></sub>
 </div>
 
 ---
