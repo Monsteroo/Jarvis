@@ -23,12 +23,18 @@ struct IntentParser {
             "згорни вікно": .windowMinimize, "розгорни вікно": .windowMaximize,
             "згорни всі вікна": .windowMinimizeAll, "згорни вікна": .windowMinimizeAll, "згорни все": .windowMinimizeAll,
             "перемісти вікно ліворуч": .windowLeftHalf, "перемісти вікно праворуч": .windowRightHalf,
+            "закрий вкладку": .tabCloseActive(nil), "закрий поточну вкладку": .tabCloseActive(nil),
+            "закрий активну вкладку": .tabCloseActive(nil), "закрий цю вкладку": .tabCloseActive(nil),
+            "закрий останню вкладку": .tabCloseLast(nil),
             "зроби гучніше": .volumeStep(10), "зроби тихіше": .volumeStep(-10),
             "вимкни звук": .mute(true), "увімкни звук": .mute(false)
         ] : [
             "minimize window": .windowMinimize, "maximize window": .windowMaximize,
             "minimize all windows": .windowMinimizeAll, "minimize everything": .windowMinimizeAll,
             "move window left": .windowLeftHalf, "move window right": .windowRightHalf,
+            "close tab": .tabCloseActive(nil), "close active tab": .tabCloseActive(nil),
+            "close current tab": .tabCloseActive(nil), "close this tab": .tabCloseActive(nil),
+            "close last tab": .tabCloseLast(nil),
             "volume up": .volumeStep(10), "volume down": .volumeStep(-10),
             "mute": .mute(true), "unmute": .mute(false)
         ]

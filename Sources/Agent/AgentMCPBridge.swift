@@ -43,13 +43,22 @@ actor AgentMCPBridge {
     private var schema: JSONValue {
         .object(["type": .string("object"), "additionalProperties": .bool(false),
             "required": .array([.string("kind")]), "properties": .object([
-                "kind": .object(["type": .string("string"), "enum": .array(["openApp", "activateApp", "quitApp", "openURL", "webSearch", "windowMinimize", "windowMaximize", "windowLeftHalf", "windowRightHalf", "windowMinimizeAll", "volumeSet", "volumeStep", "mute"].map(JSONValue.string))]),
+                "kind": .object(["type": .string("string"), "enum": .array([
+                    "openApp", "activateApp", "quitApp", "openURL", "webSearch",
+                    "windowMinimize", "windowMaximize", "windowLeftHalf", "windowRightHalf", "windowMinimizeAll",
+                    "tabCloseActive", "tabCloseLast", "uiSnapshot", "uiPress", "uiSetValue",
+                    "volumeSet", "volumeStep", "mute"
+                ].map(JSONValue.string))]),
                 "target": .object(["type": .string("string"), "maxLength": .number(2048)]),
+                "snapshot": .object(["type": .string("string"), "maxLength": .number(32)]),
+                "ref": .object(["type": .string("string"), "maxLength": .number(8)]),
+                "text": .object(["type": .string("string"), "maxLength": .number(4000)]),
                 "value": .object(["type": .string("integer"), "minimum": .number(-100), "maximum": .number(100)]),
                 "muted": .object(["type": .string("boolean")])])])
     }
     static func decodeAction(_ args: JSONValue) throws -> Action {
         guard case .object(let fields) = args, let kind = args["kind"].string else { throw AgentError.invalidMessage }
+        let keys = Set(fields.keys)
         let action: Action, allowed: Set<String>
         switch kind {
         case "openApp", "activateApp", "quitApp", "openURL", "webSearch":
@@ -57,6 +66,34 @@ actor AgentMCPBridge {
             guard let target = args["target"].string else { throw AgentError.invalidMessage }
             switch kind { case "openApp": action = .openApp(target); case "activateApp": action = .activateApp(target)
             case "quitApp": action = .quitApp(target); case "openURL": action = .openURL(target); default: action = .webSearch(target) }
+        case "tabCloseActive", "tabCloseLast", "uiSnapshot":
+            let appTarget: String?
+            if keys == ["kind"] {
+                allowed = ["kind"]
+                appTarget = nil
+            } else {
+                allowed = ["kind", "target"]
+                guard let rawTarget = args["target"].string else { throw AgentError.invalidMessage }
+                appTarget = rawTarget
+            }
+            switch kind {
+            case "tabCloseActive": action = .tabCloseActive(appTarget)
+            case "tabCloseLast": action = .tabCloseLast(appTarget)
+            default: action = .uiSnapshot(appTarget)
+            }
+        case "uiPress":
+            allowed = ["kind", "target", "snapshot", "ref"]
+            guard let target = args["target"].string,
+                  let snapshot = args["snapshot"].string,
+                  let ref = args["ref"].string else { throw AgentError.invalidMessage }
+            action = .uiPress(app: target, snapshotID: snapshot, ref: ref)
+        case "uiSetValue":
+            allowed = ["kind", "target", "snapshot", "ref", "text"]
+            guard let target = args["target"].string,
+                  let snapshot = args["snapshot"].string,
+                  let ref = args["ref"].string,
+                  let text = args["text"].string else { throw AgentError.invalidMessage }
+            action = .uiSetValue(app: target, snapshotID: snapshot, ref: ref, text: text)
         case "volumeSet", "volumeStep":
             allowed = ["kind", "value"]
             guard let value = args["value"].decimal, value >= -100, value <= 100 else { throw AgentError.invalidMessage }
@@ -73,7 +110,7 @@ actor AgentMCPBridge {
             case "windowMinimizeAll": action = .windowMinimizeAll
             default: throw AgentError.invalidMessage }
         }
-        guard Set(fields.keys) == allowed else { throw AgentError.invalidMessage }
+        guard keys == allowed else { throw AgentError.invalidMessage }
         try ActionRegistry().validate(action)
         return action
     }

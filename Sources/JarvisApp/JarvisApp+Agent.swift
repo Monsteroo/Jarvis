@@ -46,6 +46,7 @@ extension JarvisApp {
     func cancelAgent() {
         agentTask?.cancel()
         agentTask = nil
+        MainActor.assumeIsolated { executor.clearUISnapshots() }
         if let approval { MainActor.assumeIsolated { approval.dismiss() } } // also cancels the broker turn
         approval = nil
     }
@@ -98,20 +99,28 @@ extension JarvisApp {
                 let plans = await parts.broker.pendingPlans()
                 guard !Task.isCancelled, self.store.machine.turn == id, self.store.requestActivity.turn == id else { return }
                 var spoken = reply.isEmpty ? nil : AgentPersona.spokenPart(reply)
-                if plans.isEmpty {
+                let turnPlans = plans.filter { $0.turn == voiceTurn }
+                let mustConfirm = confirmActions || turnPlans.contains { self.executor.effectivePolicy(for: $0.action) == .confirmation }
+                if turnPlans.isEmpty {
                     self.finishRequest(turn: id)
-                } else if !confirmActions {
-                    // Owner decision 24.11.2026: no review panel. The native side still
-                    // approves and commits through the broker (one-time token); the model
-                    // has no approve/commit path. Esc cancels this task and the broker turn.
-                    let failure = await self.runPlansAtOnce(plans.filter { $0.turn == voiceTurn }, broker: parts.broker, language: language)
+                } else if !mustConfirm {
+                    // Owner decision 24.11.2026: no review panel for safe immediate actions.
+                    // The native side still approves and commits through the broker (one-time token);
+                    // the model has no approve/commit path. Esc cancels this task and the broker turn.
+                    let failure = await self.runPlansAtOnce(turnPlans, broker: parts.broker, language: language)
                     guard !Task.isCancelled, self.store.machine.turn == id else { return }
                     self.finishRequest(turn: id)
                     if let failure { spoken = failure }
                 } else {
+                    self.store.stages.action = .active
+                    self.store.stages.actionNote = en ? "confirm" : "підтвердження"
                     self.beginRequest(turn: id, phase: .approval)
                     let controller = AgentApprovalController(broker: parts.broker, turn: voiceTurn, language: language,
-                        onEnd: { [weak self] in self?.finishRequest(turn: id) }) { [weak self] _, outcome in
+                        onEnd: { [weak self] in
+                            guard let self else { return }
+                            if self.store.stages.action == .active { self.store.stages.action = .pending }
+                            self.finishRequest(turn: id)
+                        }) { [weak self] _, outcome in
                         self?.agentPlanFinished(outcome, language: language)
                     }
                     self.approval = controller
@@ -165,9 +174,15 @@ extension JarvisApp {
     func agentPlanFinished(_ outcome: CommandOutcome, language: String) {
         logEvent("plan", ["outcome": "\(outcome)"])
         switch outcome {
-        case .done(let summary): store.actionMessage = summary; speak(summary, language: language)
-        case .partial(let summary, let details): store.actionMessage = summary + " " + details; speak(summary, language: language)
-        case .failed(let reason): store.actionMessage = reason; speak(reason, language: language)
+        case .done(let summary):
+            store.stages.action = .done
+            store.actionMessage = summary; speak(summary, language: language)
+        case .partial(let summary, let details):
+            store.stages.action = .failed
+            store.actionMessage = summary + " " + details; speak(summary, language: language)
+        case .failed(let reason):
+            store.stages.action = .failed
+            store.actionMessage = reason; speak(reason, language: language)
         default: break
         }
     }

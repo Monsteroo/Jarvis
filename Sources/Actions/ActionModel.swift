@@ -7,6 +7,10 @@ enum Action: Equatable, Codable, Sendable {
     case windowMinimize, windowMaximize, windowLeftHalf, windowRightHalf
     /// Every standard window of every other application (not Jarvis's own).
     case windowMinimizeAll
+    case tabCloseActive(String?), tabCloseLast(String?)
+    case uiSnapshot(String?)
+    case uiPress(app: String, snapshotID: String, ref: String)
+    case uiSetValue(app: String, snapshotID: String, ref: String, text: String)
     case volumeSet(Int), volumeStep(Int), mute(Bool), dictate(String)
 }
 

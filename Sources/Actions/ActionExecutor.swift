@@ -16,6 +16,7 @@ actor ActionEvents {
 final class ActionExecutor: CommandHandling {
     private let workspace: ActionWorkspace
     private let windows: WindowActions?
+    private let uiElements: UIElementActions?
     private let audioOutput: AudioOutputActions?
     private let dictation: DictationActions?
     private let history: HistoryStore?
@@ -23,12 +24,12 @@ final class ActionExecutor: CommandHandling {
     private let registry = ActionRegistry()
     let events = ActionEvents()
 
-    init(workspace: ActionWorkspace, windows: WindowActions? = nil, audioOutput: AudioOutputActions? = nil, dictation: DictationActions? = nil, history: HistoryStore? = nil) {
-        self.workspace = workspace; self.windows = windows; self.audioOutput = audioOutput
-        self.dictation = dictation; self.history = history
+    init(workspace: ActionWorkspace, windows: WindowActions? = nil, uiElements: UIElementActions? = nil, audioOutput: AudioOutputActions? = nil, dictation: DictationActions? = nil, history: HistoryStore? = nil) {
+        self.workspace = workspace; self.windows = windows; self.uiElements = uiElements
+        self.audioOutput = audioOutput; self.dictation = dictation; self.history = history
     }
     @MainActor static func live(aliases: AppAliases = .defaults, history: HistoryStore? = nil) -> ActionExecutor {
-        ActionExecutor(workspace: MacActionWorkspace(aliases: aliases), windows: WindowActions(access: MacWindowAccess()), audioOutput: AudioOutputActions(access: MacOutputAccess()), dictation: DictationActions(access: MacDictationAccess()), history: history)
+        ActionExecutor(workspace: MacActionWorkspace(aliases: aliases), windows: WindowActions(access: MacWindowAccess()), uiElements: UIElementActions(access: MacUIElementAccess()), audioOutput: AudioOutputActions(access: MacOutputAccess()), dictation: DictationActions(access: MacDictationAccess()), history: history)
     }
 
     @MainActor func captureDictationTarget() throws -> UUID {
@@ -36,6 +37,11 @@ final class ActionExecutor: CommandHandling {
         return try dictation.capture()
     }
     @MainActor func invalidateDictationTarget() { dictation?.invalidate() }
+    @MainActor func clearUISnapshots() { uiElements?.clearSnapshots() }
+    @MainActor func describeUIAction(_ action: Action) -> String? { uiElements?.describeTarget(for: action) }
+    @MainActor func effectivePolicy(for action: Action) -> ApprovalPolicy {
+        uiElements?.effectivePolicy(for: action) ?? registry.policy(for: action)
+    }
 
     func handle(_ text: String, language: String) async -> CommandOutcome {
         await handle(text, language: language, dictationToken: nil)
@@ -110,6 +116,9 @@ final class ActionExecutor: CommandHandling {
         case .windowMinimize, .windowMaximize, .windowLeftHalf, .windowRightHalf, .windowMinimizeAll:
             if let windows { return await windows.perform(action, language: language) }
             return .failed(reason: actionText(language, "Керування вікнами не підключено.", "Window control is not connected."))
+        case .tabCloseActive, .tabCloseLast, .uiSnapshot, .uiPress, .uiSetValue:
+            if let uiElements { return await uiElements.perform(action, language: language) }
+            return .failed(reason: actionText(language, "Керування елементами вікна не підключено.", "Window element control is not connected."))
         case .volumeSet, .volumeStep, .mute:
             if let audioOutput { return await audioOutput.perform(action, language: language) }
             return .failed(reason: actionText(language, "Керування звуком не підключено.", "Sound control is not connected."))

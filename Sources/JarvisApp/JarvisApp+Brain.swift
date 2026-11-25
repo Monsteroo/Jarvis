@@ -75,12 +75,35 @@ extension JarvisApp {
                 let result = try await self.brain.respond(
                     to: text, language: language, system: system, context: context, apiKey: key, thinking: thinking,
                     execute: { [weak self] action in
+                        guard let self else {
+                            return .executed(.failed(reason: en ? "The action was cancelled." : "Дію скасовано."))
+                        }
                         do {
-                            let plan = try await parts.broker.propose(action, turn: voiceTurn)
-                            if confirm { return .proposed }
+                            if case .uiSnapshot = action {
+                                self.store.actionMessage = en ? "Reading window…" : "Читаю вікно…"
+                                let outcome = await self.executor.handle(action: action, language: language)
+                                let loggedOutcome: String
+                                switch outcome {
+                                case .done(let text): loggedOutcome = "done (\(text.count) chars)"
+                                case .failed(let reason): loggedOutcome = "failed: \(reason)"
+                                default: loggedOutcome = "\(outcome)"
+                                }
+                                self.logEvent("brain_action", ["action": "uiSnapshot", "outcome": loggedOutcome])
+                                return .executed(outcome)
+                            }
+                            let detail = self.executor.describeUIAction(action)
+                            let policy = self.executor.effectivePolicy(for: action)
+                            let plan = try await parts.broker.propose(action, turn: voiceTurn, detail: detail)
+                            if confirm || policy == .confirmation { return .proposed }
                             let token = try await parts.broker.approve(plan: plan.id)
                             let outcome = try await parts.broker.commit(plan: plan.id, token: token)
-                            self?.logEvent("brain_action", ["action": "\(action)", "outcome": "\(outcome)"])
+                            let actionName: String
+                            if case .uiSetValue(let app, let snap, let ref, _) = action {
+                                actionName = "uiSetValue(\(app), \(snap), \(ref))"
+                            } else {
+                                actionName = "\(action)"
+                            }
+                            self.logEvent("brain_action", ["action": actionName, "outcome": "\(outcome)"])
                             return .executed(outcome)
                         } catch {
                             return .executed(.failed(reason: en ? "The action was cancelled." : "Дію скасовано."))
@@ -106,10 +129,18 @@ extension JarvisApp {
                 self.refreshAgentBudget()
                 let plans = await parts.broker.pendingPlans().filter { $0.turn == voiceTurn }
                 guard !Task.isCancelled, self.store.machine.turn == id else { return }
-                if confirm, !plans.isEmpty {
+                if !plans.isEmpty {
+                    self.store.stages.action = .active
+                    self.store.stages.actionNote = en
+                        ? String(format: "confirm · $%.4f", Double(result.usage.costMicros) / 1_000_000)
+                        : String(format: "підтвердження · $%.4f", Double(result.usage.costMicros) / 1_000_000)
                     self.beginRequest(turn: id, phase: .approval)
                     let controller = AgentApprovalController(broker: parts.broker, turn: voiceTurn, language: language,
-                        onEnd: { [weak self] in self?.finishRequest(turn: id) }) { [weak self] _, outcome in
+                        onEnd: { [weak self] in
+                            guard let self else { return }
+                            if self.store.stages.action == .active { self.store.stages.action = .pending }
+                            self.finishRequest(turn: id)
+                        }) { [weak self] _, outcome in
                         self?.agentPlanFinished(outcome, language: language)
                     }
                     self.approval = controller

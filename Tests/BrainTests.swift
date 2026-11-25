@@ -253,5 +253,61 @@ func usage(_ prompt: Int, cached: Int = 0, _ completion: Int) -> String {
         check(MacContext.resolvable("термінал", installed: [], running: [], aliases: ["термінал"]), "alias resolves")
         check(!MacContext.resolvable("ютуб в хромі", installed: ["Google Chrome"], running: [], aliases: []), "phrase does not resolve")
         check(!MacContext.resolvable("календар", installed: ["Calendar"], running: [], aliases: []), "Ukrainian name goes to the brain")
+
+        // 11. UI AX loop: uiSnapshot continues to next round, allows >3 UI button presses,
+        // never speaks raw snapshot XML, and strips snapshot payload from BrainMemory.
+        let fencedSnap1 = UISnapshotText.fence(snapshotID: "abcd1234", body: "# snapshot\ne1 AXStaticText \"0\" [read]\ne2 AXButton \"2\" [press]\ne3 AXButton \"+\" [press]\ne4 AXButton \"=\" [press]")
+        let fencedSnap2 = UISnapshotText.fence(snapshotID: "abcd5678", body: "# snapshot\ne1 AXStaticText \"4\" [read]")
+        let calcTransport = FakeTransport([
+            (200, [tool(0, id: "s1", name: "run_action", args: "{\"kind\":\"uiSnapshot\",\"target\":\"Calculator\"}"), usage(100, 10), "data: [DONE]"]),
+            (200, [
+                tool(0, id: "p1", name: "run_action", args: "{\"kind\":\"uiPress\",\"target\":\"Calculator\",\"snapshot\":\"abcd1234\",\"ref\":\"e2\"}"),
+                tool(1, id: "p2", name: "run_action", args: "{\"kind\":\"uiPress\",\"target\":\"Calculator\",\"snapshot\":\"abcd1234\",\"ref\":\"e3\"}"),
+                tool(2, id: "p3", name: "run_action", args: "{\"kind\":\"uiPress\",\"target\":\"Calculator\",\"snapshot\":\"abcd1234\",\"ref\":\"e2\"}"),
+                tool(3, id: "p4", name: "run_action", args: "{\"kind\":\"uiPress\",\"target\":\"Calculator\",\"snapshot\":\"abcd1234\",\"ref\":\"e4\"}"),
+                tool(4, id: "s2", name: "run_action", args: "{\"kind\":\"uiSnapshot\",\"target\":\"Calculator\"}"),
+                usage(200, 30), "data: [DONE]",
+            ]),
+            (200, [text("Чотири, сер."), usage(180, 8), "data: [DONE]"]),
+        ])
+        let calcBrain = JarvisBrain(transport: calcTransport, model: "gpt-5.4-mini")
+        var calcSentences: [String] = []
+        var snapCallIndex = 0
+        var calcActions: [Action] = []
+        let calcRes = try? await calcBrain.respond(
+            to: "Порахуй 2 + 2 на калькуляторі", language: "uk", system: "S", context: "", apiKey: "k",
+            execute: { action in
+                calcActions.append(action)
+                if case .uiSnapshot = action {
+                    snapCallIndex += 1
+                    return .executed(.done(summary: snapCallIndex == 1 ? fencedSnap1 : fencedSnap2))
+                }
+                return .executed(.done(summary: "Натиснуто"))
+            },
+            onSentence: { calcSentences.append($0) }
+        )
+        check(calcRes?.rounds == 3 && calcActions.count == 6, "3-round UI observation-act-verify loop ran 6 UI tool calls")
+        check(calcSentences == ["Чотири, сер."] && calcRes?.spoken == nil, "Only final verified answer is spoken, never raw snapshot")
+        let storedMsgs = calcBrain.memory.messages()
+        let leakedSnapshot = storedMsgs.contains { ($0["content"] as? String)?.contains("UNTRUSTED_UI_SNAPSHOT_") == true }
+        check(!leakedSnapshot, "Raw UI snapshots redacted from BrainMemory after turn")
+
+        // 12. Proposed UI action after snapshot stops and announces confirmation on screen;
+        // uiSetValue masks sensitive text in result.actions log.
+        let confirmTransport = FakeTransport([
+            (200, [tool(0, id: "s1", name: "run_action", args: "{\"kind\":\"uiSnapshot\",\"target\":\"Notes\"}"), "data: [DONE]"]),
+            (200, [tool(0, id: "w1", name: "run_action", args: "{\"kind\":\"uiSetValue\",\"target\":\"Notes\",\"snapshot\":\"abcd1234\",\"ref\":\"e1\",\"text\":\"Secret note body\"}"), "data: [DONE]"]),
+        ])
+        let confirmRes = try? await JarvisBrain(transport: confirmTransport, model: "m").respond(
+            to: "Запиши в нотатки", language: "uk", system: "S", context: "", apiKey: "k",
+            execute: { action in
+                if case .uiSnapshot = action { return .executed(.done(summary: fencedSnap1)) }
+                return .proposed
+            },
+            onSentence: { _ in }
+        )
+        check(confirmRes?.rounds == 2 && confirmRes?.spoken == "Чекає вашого підтвердження на екрані, сер.", "Proposed UI write announces confirmation")
+        let actionLogs = confirmRes?.actions.map(\.action).joined(separator: " ") ?? ""
+        check(!actionLogs.contains("Secret note body") && actionLogs.contains("<redacted>"), "uiSetValue text redacted in action logs")
     }
 }

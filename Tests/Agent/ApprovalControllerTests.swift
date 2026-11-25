@@ -10,6 +10,9 @@ import Foundation
         let b = try await broker.propose(.openURL("https://example.com"), turn: turn)
         var ended = 0, outcomes = 0
         let controller = AgentApprovalController(broker: broker, turn: turn, language: "uk", onEnd: { ended += 1 }) { _, _ in outcomes += 1 }
+        let uiPlan = AgentActionPlan(id: UUID(), turn: turn, action: .uiPress(app: "Google Chrome", snapshotID: "abcd1234", ref: "e4"), expiresAt: Date().addingTimeInterval(60), detail: "Google Chrome: AXLink «Video\u{202E}»")
+        let renderedDesc = controller.description(for: uiPlan)
+        check(renderedDesc.contains("AXLink") && renderedDesc.contains("\\u{202e}") && renderedDesc.contains("[e4]"), "UI plan renders resolved element detail and escapes bidi")
         await controller.refresh() // Populate state without displaying any windows.
         check(controller.plans.count == 2, "Both plans loaded")
         controller.reject(a)

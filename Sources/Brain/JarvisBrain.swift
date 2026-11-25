@@ -71,6 +71,8 @@ final class JarvisBrain {
     var memory = BrainMemory()
     var maxRounds = 3
     var maxToolCalls = 3
+    var maxUIRounds = 5
+    var maxUIToolCalls = 8
     /// Cleared if the model rejects `reasoning_effort`; then it is omitted.
     private(set) var sendsReasoning = true
     private let clock: () -> TimeInterval
@@ -95,10 +97,14 @@ final class JarvisBrain {
         var turn: [[String: Any]] = [["role": "user", "content": context.isEmpty ? text : context + "\n\n" + text]]
         var result = Result()
         var toolCalls = 0
+        var uiToolCalls = 0
         var spokenChars = 0
         let started = clock()
+        var roundLimit = maxRounds
+        var round = 0
 
-        for round in 1...maxRounds {
+        while round < roundLimit {
+            round += 1
             try Task.checkCancellation()
             result.rounds = round
             let messages: [[String: Any]] = [["role": "system", "content": system]] + history + turn
@@ -131,7 +137,7 @@ final class JarvisBrain {
             if calls.isEmpty {
                 guard !text.isEmpty else { throw BrainError.noAnswer }
                 turn.append(["role": "assistant", "content": text])
-                memory.append(turn: turn)
+                memory.append(turn: Self.redactSnapshotsForMemory(turn))
                 return result
             }
 
@@ -139,31 +145,54 @@ final class JarvisBrain {
                          "tool_calls": calls.map { ["id": $0.id, "type": "function",
                                                     "function": ["name": $0.name, "arguments": $0.arguments]] }])
             var summaries: [String] = [], failures: [String] = [], proposed = 0
+            var sawSnapshot = false
             for call in calls {
                 let toolText: String
-                if toolCalls >= maxToolCalls {
-                    toolText = "Skipped: at most \(maxToolCalls) actions per request. Nothing was executed."
-                    failures.append(en ? "That is more actions than I take at once, sir." : "Забагато дій за один раз, сер.")
-                } else if call.name != "run_action" {
+                if call.name != "run_action" {
                     toolText = "Rejected: unknown tool. Nothing was executed."
                     failures.append(en ? "I could not tell which action to take, sir." : "Не зрозумів, яку дію виконати, сер.")
                 } else if let action = Self.decode(call.arguments) {
-                    toolCalls += 1
-                    switch await execute(action) {
-                    case .proposed:
-                        proposed += 1
-                        toolText = "Proposed. It awaits the owner's confirmation on screen; not executed yet."
-                    case .executed(let outcome):
-                        switch outcome {
-                        case .done(let summary): summaries.append(summary); toolText = "Done: \(summary)"
-                        case .partial(let summary, let details): failures.append(summary + " " + details); toolText = "Partly done: \(summary) \(details)"
-                        case .failed(let reason): failures.append(reason); toolText = "Failed: \(reason)"
-                        default:
-                            failures.append(en ? "The action did not run." : "Дію не виконано.")
-                            toolText = "Not executed."
+                    let isUI = Self.isUIAction(action)
+                    if isUI { roundLimit = max(roundLimit, maxUIRounds) }
+                    if (!isUI && toolCalls >= maxToolCalls) || (isUI && uiToolCalls >= maxUIToolCalls) {
+                        let cap = isUI ? maxUIToolCalls : maxToolCalls
+                        toolText = "Skipped: at most \(cap) actions per request. Nothing was executed."
+                        failures.append(en ? "That is more actions than I take at once, sir." : "Забагато дій за один раз, сер.")
+                    } else {
+                        if isUI { uiToolCalls += 1 } else { toolCalls += 1 }
+                        let actionLabel = Self.safeActionLogLabel(action)
+                        switch await execute(action) {
+                        case .proposed:
+                            proposed += 1
+                            toolText = "Proposed. It awaits the owner's confirmation on screen; not executed yet."
+                            result.actions.append((action: actionLabel, result: toolText))
+                        case .executed(let outcome):
+                            switch outcome {
+                            case .done(let summary):
+                                if case .uiSnapshot = action {
+                                    sawSnapshot = true
+                                    toolText = summary
+                                    result.actions.append((action: actionLabel, result: "Done: snapshot (\(summary.count) chars)"))
+                                } else {
+                                    summaries.append(summary)
+                                    toolText = "Done: \(summary)"
+                                    result.actions.append((action: actionLabel, result: toolText))
+                                }
+                            case .partial(let summary, let details):
+                                failures.append(summary + " " + details)
+                                toolText = "Partly done: \(summary) \(details)"
+                                result.actions.append((action: actionLabel, result: toolText))
+                            case .failed(let reason):
+                                failures.append(reason)
+                                toolText = "Failed: \(reason)"
+                                result.actions.append((action: actionLabel, result: toolText))
+                            default:
+                                failures.append(en ? "The action did not run." : "Дію не виконано.")
+                                toolText = "Not executed."
+                                result.actions.append((action: actionLabel, result: toolText))
+                            }
                         }
                     }
-                    result.actions.append((action: "\(action)", result: toolText))
                 } else {
                     toolText = "Rejected: invalid arguments. Nothing was executed."
                     failures.append(en ? "I could not tell which action to take, sir." : "Не зрозумів, яку дію виконати, сер.")
@@ -174,9 +203,10 @@ final class JarvisBrain {
             try Task.checkCancellation()
 
             // Actions report their own outcome: no second model round when
-            // everything went through (saves about a second). On a failure the
-            // model sees the result and may explain or try another way.
-            if failures.isEmpty || round == maxRounds {
+            // everything went through (saves about a second), EXCEPT after
+            // `uiSnapshot`, where the model must inspect the elements next.
+            let continueAfterSnapshot = sawSnapshot && proposed == 0 && round < roundLimit
+            if (!continueAfterSnapshot && failures.isEmpty) || round >= roundLimit {
                 let say: String
                 if let failure = failures.first {
                     say = failure
@@ -192,7 +222,7 @@ final class JarvisBrain {
                 if !(failures.isEmpty && proposed == 0 && !text.isEmpty) { result.spoken = say }
                 if result.reply.isEmpty { result.reply = say } else if result.spoken != nil { result.reply += " " + say }
                 turn.append(["role": "assistant", "content": say])
-                memory.append(turn: turn)
+                memory.append(turn: Self.redactSnapshotsForMemory(turn))
                 return result
             }
         }
@@ -277,6 +307,33 @@ final class JarvisBrain {
         return lower.contains("how many") || lower.contains("how much") || lower.contains("how long")
     }
 
+    private static func isUIAction(_ action: Action) -> Bool {
+        switch action {
+        case .uiSnapshot, .uiPress, .uiSetValue: return true
+        default: return false
+        }
+    }
+
+    private static func safeActionLogLabel(_ action: Action) -> String {
+        if case .uiSetValue(let app, let snapshotID, let ref, _) = action {
+            return "uiSetValue(app: \"\(app)\", snapshotID: \"\(snapshotID)\", ref: \"\(ref)\", text: <redacted>)"
+        }
+        return "\(action)"
+    }
+
+    private static func redactSnapshotsForMemory(_ turn: [[String: Any]]) -> [[String: Any]] {
+        turn.map { message in
+            guard message["role"] as? String == "tool",
+                  let content = message["content"] as? String,
+                  content.contains("<UNTRUSTED_UI_SNAPSHOT_") else {
+                return message
+            }
+            var copy = message
+            copy["content"] = "[UI snapshot omitted after turn]"
+            return copy
+        }
+    }
+
     /// Same typed schema as the Goose MCP tool; arguments are checked by
     /// `AgentMCPBridge.decodeAction` and `ActionRegistry`. Dictation is absent.
     static let tool: [String: Any] = [
@@ -287,16 +344,26 @@ final class JarvisBrain {
             Run one action on the owner's Mac. kind and fields: openApp/activateApp/quitApp {target: exact application name \
             from the installed list}; openURL {target: full https URL, opens in the default browser}; webSearch {target: query}; \
             windowMinimize/windowMaximize/windowLeftHalf/windowRightHalf {} act on the front window; \
-            windowMinimizeAll {} minimizes every window of every application; volumeSet {value: 0…100}; \
-            volumeStep {value: -100…100}; mute {muted: true|false}. Call it once per action, in order.
+            windowMinimizeAll {} minimizes every window of every application; \
+            tabCloseActive/tabCloseLast {optional target: browser name} close the active or rightmost browser tab; \
+            uiSnapshot {optional target: application name} reads accessible window elements with a snapshot id and e1…eN refs; \
+            uiPress {target: application name, snapshot: snapshot id, ref: eN} presses an element from a fresh uiSnapshot; \
+            uiSetValue {target: application name, snapshot: snapshot id, ref: eN, text: value} writes text into a field without sending; \
+            volumeSet {value: 0…100}; volumeStep {value: -100…100}; mute {muted: true|false}. Call it once per action, in order.
             """,
             "parameters": [
                 "type": "object", "additionalProperties": false, "required": ["kind"],
                 "properties": [
-                    "kind": ["type": "string", "enum": ["openApp", "activateApp", "quitApp", "openURL", "webSearch",
-                                                        "windowMinimize", "windowMaximize", "windowLeftHalf", "windowRightHalf", "windowMinimizeAll",
-                                                        "volumeSet", "volumeStep", "mute"]],
+                    "kind": ["type": "string", "enum": [
+                        "openApp", "activateApp", "quitApp", "openURL", "webSearch",
+                        "windowMinimize", "windowMaximize", "windowLeftHalf", "windowRightHalf", "windowMinimizeAll",
+                        "tabCloseActive", "tabCloseLast", "uiSnapshot", "uiPress", "uiSetValue",
+                        "volumeSet", "volumeStep", "mute"
+                    ]],
                     "target": ["type": "string", "maxLength": 2048],
+                    "snapshot": ["type": "string", "maxLength": 32],
+                    "ref": ["type": "string", "maxLength": 8],
+                    "text": ["type": "string", "maxLength": 4000],
                     "value": ["type": "integer", "minimum": -100, "maximum": 100],
                     "muted": ["type": "boolean"],
                 ],

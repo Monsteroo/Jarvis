@@ -91,6 +91,27 @@ import SwiftUI
         Task { [broker, turn] in await broker.cancel(turn: turn) }
         notifyEnd()
     }
+    func description(for plan: AgentActionPlan) -> String {
+        func literal(_ value: String) -> String {
+            value.unicodeScalars.map { scalar in
+                if CharacterSet.controlCharacters.contains(scalar) || (0x202A...0x202E).contains(scalar.value) || (0x2066...0x2069).contains(scalar.value) {
+                    return "\\u{" + String(scalar.value, radix: 16) + "}"
+                }
+                return String(scalar)
+            }.joined()
+        }
+        if let detail = plan.detail, !detail.isEmpty {
+            switch plan.action {
+            case .uiPress(_, _, let ref):
+                return actionText(language, "Натиснути елемент: ", "Press element: ") + literal(detail) + " [\(literal(ref))]"
+            case .uiSetValue(_, _, let ref, let text):
+                return actionText(language, "Ввести у поле ", "Insert into ") + literal(detail) + " [\(literal(ref))]: «" + literal(text) + "»"
+            default:
+                break
+            }
+        }
+        return description(plan.action)
+    }
     func description(_ action: Action) -> String {
         func literal(_ value: String) -> String {
             // Make control/bidi characters visible in review without changing actual parameters.
@@ -112,6 +133,19 @@ import SwiftUI
         case .windowMaximize: return actionText(language, "Розгорнути активне вікно", "Maximize active window")
         case .windowLeftHalf: return actionText(language, "Активне вікно — ліворуч", "Active window — left half")
         case .windowRightHalf: return actionText(language, "Активне вікно — праворуч", "Active window — right half")
+        case .tabCloseActive(let app):
+            if let app { return actionText(language, "Закрити активну вкладку: ", "Close active tab: ") + literal(app) }
+            return actionText(language, "Закрити активну вкладку браузера", "Close active browser tab")
+        case .tabCloseLast(let app):
+            if let app { return actionText(language, "Закрити останню вкладку: ", "Close last tab: ") + literal(app) }
+            return actionText(language, "Закрити останню вкладку браузера", "Close last browser tab")
+        case .uiSnapshot(let app):
+            if let app { return actionText(language, "Прочитати елементи вікна: ", "Read window elements: ") + literal(app) }
+            return actionText(language, "Прочитати елементи переднього вікна", "Read front window elements")
+        case .uiPress(let app, _, let ref):
+            return actionText(language, "Натиснути елемент у «", "Press element in ‘") + literal(app) + actionText(language, "» [", "’ [") + literal(ref) + "]"
+        case .uiSetValue(let app, _, let ref, let text):
+            return actionText(language, "Ввести у «", "Insert into ‘") + literal(app) + actionText(language, "» [", "’ [") + literal(ref) + "]: «" + literal(text) + "»"
         case .volumeSet(let percent): return actionText(language, "Гучність: ", "Volume: ") + "\(percent)%"
         case .volumeStep(let step): return actionText(language, "Змінити гучність на ", "Change volume by ") + "\(step)%"
         case .mute(let muted): return muted ? actionText(language, "Вимкнути звук", "Mute") : actionText(language, "Увімкнути звук", "Unmute")
@@ -138,7 +172,7 @@ private final class AgentReviewPanel: NSPanel {
                 VStack(spacing: 12) {
                     ForEach(controller.plans, id: \.id) { plan in
                         VStack(alignment: .leading, spacing: 10) {
-                            Text(controller.description(plan.action)).font(.system(size: 15, weight: .medium)).frame(maxWidth: .infinity, alignment: .leading)
+                            Text(controller.description(for: plan)).font(.system(size: 15, weight: .medium)).frame(maxWidth: .infinity, alignment: .leading)
                             if let result = controller.results[plan.id] {
                                 Text(result).font(.system(size: 13)).foregroundStyle(.secondary)
                             } else {

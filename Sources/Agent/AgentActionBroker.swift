@@ -17,6 +17,7 @@ struct AgentActionPlan: Equatable, Sendable {
     let turn: UUID
     let action: Action
     let expiresAt: Date
+    var detail: String? = nil
 }
 enum ApprovalError: Error { case inactiveTurn, invalidToken, expired, unsupportedAction, tooManyPlans }
 
@@ -35,16 +36,27 @@ actor AgentActionBroker {
         plans.removeAll()
         current = ["uk", "en"].contains(language) ? (turn, language) : nil
     }
-    func propose(_ action: Action, turn: UUID) throws -> AgentActionPlan {
+    func propose(_ action: Action, turn: UUID, detail: String? = nil) throws -> AgentActionPlan {
         guard current?.id == turn else { throw ApprovalError.inactiveTurn }
-        guard case .dictate = action else { return try add(action, turn: turn) }
-        throw ApprovalError.unsupportedAction // No model-triggered insertion into an implicit field.
+        switch action {
+        case .dictate:
+            throw ApprovalError.unsupportedAction // No model-triggered insertion into an implicit field.
+        case .uiSnapshot(let app?) where UIElementSecurity.isBlockedSensitiveApp(name: app):
+            throw ApprovalError.unsupportedAction
+        case .uiPress(let app, _, _) where UIElementSecurity.isBlockedSensitiveApp(name: app):
+            throw ApprovalError.unsupportedAction
+        case .uiSetValue(let app, _, _, _) where UIElementSecurity.isBlockedSensitiveApp(name: app):
+            throw ApprovalError.unsupportedAction
+        default:
+            return try add(action, turn: turn, detail: detail)
+        }
     }
-    private func add(_ action: Action, turn: UUID) throws -> AgentActionPlan {
+    private func add(_ action: Action, turn: UUID, detail: String?) throws -> AgentActionPlan {
         try ActionRegistry().validate(action)
         plans = plans.filter { $0.value.deadline > uptime() }
         guard plans.count < 32 else { throw ApprovalError.tooManyPlans }
-        let plan = AgentActionPlan(id: UUID(), turn: turn, action: action, expiresAt: now().addingTimeInterval(120))
+        let trimmedDetail = detail.map { String($0.prefix(160)) }
+        let plan = AgentActionPlan(id: UUID(), turn: turn, action: action, expiresAt: now().addingTimeInterval(120), detail: trimmedDetail)
         plans[plan.id] = Entry(plan: plan, deadline: uptime() + 120, token: nil)
         return plan
     }

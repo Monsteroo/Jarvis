@@ -26,6 +26,7 @@ extension JarvisApp {
     func cancelCommand() {
         commandTask?.cancel()
         commandTask = nil
+        MainActor.assumeIsolated { executor.clearUISnapshots() }
         cancelAgent()
         store.requestActivity.cancel()
         refreshEscape()
